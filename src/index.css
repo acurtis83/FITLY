@@ -1,0 +1,23 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  margin: 0;
+  background: #000000;
+  color: #ffffff;
+  font-family: -apple-system, system-ui, "Segoe UI", Roboto, sans-serif;
+  /* keep the dark theme edge-to-edge on phones with notches */
+  overscroll-behavior-y: none;
+}
+
+/* dark scrollbars */
+* {
+  scrollbar-color: #3a3a3c transparent;
+}
