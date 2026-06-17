@@ -1,17 +1,11 @@
 <svg viewBox="0 0 100 100" xmlns="http://www.w3.org/2000/svg">
   <defs>
-    <linearGradient id="e" x1="0" y1="1" x2="0" y2="0">
-      <stop offset="0" stop-color="#F31260"/><stop offset="1" stop-color="#FF375F"/>
-    </linearGradient>
-    <linearGradient id="p" x1="0" y1="1" x2="0" y2="0">
-      <stop offset="0" stop-color="#6FE000"/><stop offset="1" stop-color="#B6FF3B"/>
-    </linearGradient>
-    <linearGradient id="t" x1="0" y1="1" x2="0" y2="0">
-      <stop offset="0" stop-color="#00C7D4"/><stop offset="1" stop-color="#00F0C8"/>
-    </linearGradient>
+    <linearGradient id="e" x1="0" y1="1" x2="0" y2="0"><stop offset="0" stop-color="#F31260"/><stop offset="1" stop-color="#FF375F"/></linearGradient>
+    <linearGradient id="p" x1="0" y1="1" x2="0" y2="0"><stop offset="0" stop-color="#6FE000"/><stop offset="1" stop-color="#B6FF3B"/></linearGradient>
+    <linearGradient id="t" x1="0" y1="1" x2="0" y2="0"><stop offset="0" stop-color="#00C7D4"/><stop offset="1" stop-color="#00F0C8"/></linearGradient>
   </defs>
   <rect x="0" y="0" width="100" height="100" rx="22" fill="#141416"/>
-  <rect x="24" y="50" width="13" height="28" rx="6.5" fill="url(#e)"/>
-  <rect x="43.5" y="36" width="13" height="42" rx="6.5" fill="url(#p)"/>
-  <rect x="63" y="22" width="13" height="56" rx="6.5" fill="url(#t)"/>
+  <rect x="28" y="24" width="13" height="52" rx="6.5" fill="url(#t)"/>
+  <rect x="45" y="24" width="27" height="13" rx="6.5" fill="url(#e)"/>
+  <rect x="45" y="43" width="20" height="13" rx="6.5" fill="url(#p)"/>
 </svg>
