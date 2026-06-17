@@ -2494,11 +2494,63 @@ function BarcodeScanner({ meal, onAdd, onBack }) {
   );
 }
 
+// Lazily load the Tesseract.js OCR engine from CDN (deployed app only; needs network).
+function loadTesseract() {
+  if (typeof window === "undefined") return Promise.reject(new Error("no window"));
+  if (window.Tesseract) return Promise.resolve(window.Tesseract);
+  if (window.__tessPromise) return window.__tessPromise;
+  window.__tessPromise = new Promise((resolve, reject) => {
+    const s = document.createElement("script");
+    s.src = "https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js";
+    s.async = true;
+    s.onload = () => (window.Tesseract ? resolve(window.Tesseract) : reject(new Error("OCR load failed")));
+    s.onerror = () => reject(new Error("OCR load failed"));
+    document.head.appendChild(s);
+  });
+  return window.__tessPromise;
+}
+// Pull calories / macros / serving out of OCR'd nutrition-label text (line-based, no lookbehind).
+function parseNutritionText(raw) {
+  const lines = (raw || "").split(/\n+/).map((l) => l.trim()).filter(Boolean);
+  const find = (pred) => lines.find(pred) || "";
+  const firstNum = (s) => { const m = s.match(/(\d{1,4}(?:\.\d+)?)/); return m ? m[1] : ""; };
+  const calLine = find((l) => /calorie/i.test(l));
+  let cal = "";
+  { const nums = calLine.match(/\d{1,4}/g) || []; cal = nums.length ? nums[nums.length - 1] : ""; }
+  if (!cal) { const i = lines.findIndex((l) => /calorie/i.test(l)); if (i >= 0 && lines[i + 1]) cal = firstNum(lines[i + 1]); }
+  const fatLine = find((l) => /total\s*fat/i.test(l)) || find((l) => /\bfat\b/i.test(l) && !/saturat|trans/i.test(l));
+  const carbLine = find((l) => /carb/i.test(l));
+  const protLine = find((l) => /protein/i.test(l));
+  const servLine = find((l) => /serving\s*size/i.test(l));
+  let serving = "";
+  if (servLine) serving = servLine.replace(/.*serving\s*size[:\s]*/i, "").trim();
+  return { cal, f: firstNum(fatLine), c: firstNum(carbLine), p: firstNum(protLine), serving };
+}
+
 function AddFoodSheet({ meal, customFoods = [], meals = [], onClose, onAdd, onAddMeal, onNewMeal, onRemoveCached }) {
   const [mode, setMode] = useState("search"); // search | custom | barcode
   const [tab, setTab] = useState("foods");    // foods | meals
   const [q, setQ] = useState("");
   const [custom, setCustom] = useState({ name: "", serving: "", cal: "", p: "", c: "", f: "" });
+  const [ocr, setOcr] = useState({ busy: false, msg: "", err: "" });
+  const scanLabel = async (file) => {
+    if (!file) return;
+    setOcr({ busy: true, msg: "Reading the label… this can take a few seconds.", err: "" });
+    try {
+      const T = await loadTesseract();
+      const { data } = await T.recognize(file, "eng");
+      const parsed = parseNutritionText(data && data.text);
+      const got = parsed.cal || parsed.p || parsed.c || parsed.f;
+      setCustom((p) => ({
+        ...p,
+        serving: parsed.serving || p.serving,
+        cal: parsed.cal || p.cal, p: parsed.p || p.p, c: parsed.c || p.c, f: parsed.f || p.f,
+      }));
+      setOcr({ busy: false, msg: got ? "Filled in what I could read — double-check the values below." : "", err: got ? "" : "Couldn't read the values. Try a flatter, well-lit photo, or type them in." });
+    } catch {
+      setOcr({ busy: false, msg: "", err: "Couldn't run the scanner (needs an internet connection). You can still enter values manually." });
+    }
+  };
   const ql = q.toLowerCase();
   const mine = customFoods.filter((f) => f.name.toLowerCase().includes(ql));
   const builtins = FOODS.filter((f) => f.name.toLowerCase().includes(ql));
@@ -2520,6 +2572,17 @@ function AddFoodSheet({ meal, customFoods = [], meals = [], onClose, onAdd, onAd
           <button onClick={() => setMode("search")} className="flex items-center gap-1 text-sm font-semibold" style={{ color: C.carb }}>
             <ArrowLeft size={16} /> Back to search
           </button>
+
+          <label className="flex cursor-pointer items-center justify-center gap-2 rounded-2xl py-3 font-bold" style={{ background: ocr.busy ? C.card2 : C.carb, color: ocr.busy ? C.sub : "#1a1100" }}>
+            {ocr.busy ? <Loader size={16} className="animate-spin" /> : <Camera size={16} />}
+            {ocr.busy ? "Reading label…" : "Scan nutrition label"}
+            <input type="file" accept="image/*" capture="environment" className="hidden" disabled={ocr.busy}
+              onChange={(e) => scanLabel(e.target.files && e.target.files[0])} />
+          </label>
+          {ocr.msg && <p className="text-xs" style={{ color: C.sub }}>{ocr.msg}</p>}
+          {ocr.err && <p className="text-xs font-semibold" style={{ color: C.energy1 }}>{ocr.err}</p>}
+          <p className="text-center text-xs" style={{ color: C.faint }}>or enter the values manually</p>
+
           <input value={custom.name} onChange={(e) => setCustom((p) => ({ ...p, name: e.target.value }))} placeholder="Name"
             className="rounded-xl px-3 py-2.5 font-semibold outline-none" style={{ background: C.card2, color: C.text }} />
           <input value={custom.serving} onChange={(e) => setCustom((p) => ({ ...p, serving: e.target.value }))} placeholder="Serving (e.g. 1 cup)"
@@ -2579,7 +2642,7 @@ function AddFoodSheet({ meal, customFoods = [], meals = [], onClose, onAdd, onAd
               <Barcode size={15} /> Scan barcode
             </button>
             <button onClick={() => setMode("custom")} className="flex items-center justify-center gap-1 rounded-xl py-2.5 text-sm font-bold" style={{ background: C.card2, color: C.carb }}>
-              <Pencil size={14} /> Custom food
+              <Camera size={14} /> Scan / custom
             </button>
           </div>
           <div className="mt-2 pb-2">
