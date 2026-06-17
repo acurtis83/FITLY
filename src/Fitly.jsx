@@ -8,7 +8,7 @@ import {
   Flame, Dumbbell, Apple, Activity, BarChart3, Plus, Check, X,
   ChevronLeft, ChevronRight, Settings, Timer, Trophy, Trash2,
   TrendingUp, Play, Search, Pencil, ArrowLeft, Clock,
-  Scale, Barcode, Camera, Loader, Calendar, Star, BookMarked, ChevronDown, Layers, Bookmark, Volume2, VolumeX, Copy,
+  Scale, Barcode, Camera, Loader, Calendar, Star, BookMarked, ChevronDown, Layers, Bookmark, Volume2, VolumeX, Copy, RotateCw, RotateCcw,
 } from "lucide-react";
 
 /* ============================================================
@@ -2524,29 +2524,156 @@ function parseNutritionText(raw) {
   const servLine = find((l) => /serving\s*size/i.test(l));
   let serving = "";
   if (servLine) serving = servLine.replace(/.*serving\s*size[:\s]*/i, "").trim();
-  return { cal, f: firstNum(fatLine), c: firstNum(carbLine), p: firstNum(protLine), serving };
+  const satFat = firstNum(find((l) => /sat/i.test(l) && /fat/i.test(l)));
+  const fiber = firstNum(find((l) => /fib(er|re)/i.test(l)));
+  const sugar = firstNum(find((l) => /sugar/i.test(l) && !/added/i.test(l)));
+  const sodium = firstNum(find((l) => /sodium/i.test(l)));
+  // best-effort product name: a wordy line that isn't part of the panel
+  const skip = /nutrition|serving|amount|calorie|fat|cholesterol|sodium|carbohydrate|fiber|fibre|sugar|protein|vitamin|calcium|iron|potassium|daily value|per container|includes|added/i;
+  const nameLine = lines.find((l) => /[a-z]/i.test(l) && l.replace(/[^a-z]/gi, "").length >= 4 && !skip.test(l) && !/^\d/.test(l));
+  return { cal, f: firstNum(fatLine), c: firstNum(carbLine), p: firstNum(protLine), serving, satFat, fiber, sugar, sodium, name: nameLine ? nameLine.trim().slice(0, 40) : "" };
+}
+
+// Rotate + crop a label photo before OCR (touch/pointer; improves accuracy a lot).
+function LabelCropper({ file, busy, onScan, onCancel }) {
+  const wrapRef = useRef(null);
+  const viewRef = useRef(null);
+  const baseRef = useRef(null);
+  const dragRef = useRef(null);
+  const [img, setImg] = useState(null);
+  const [rot, setRot] = useState(0);
+  const [disp, setDisp] = useState({ w: 0, h: 0, scale: 1 });
+  const [box, setBox] = useState(null);
+
+  useEffect(() => {
+    const url = URL.createObjectURL(file);
+    const im = new Image();
+    im.onload = () => setImg(im);
+    im.src = url;
+    return () => URL.revokeObjectURL(url);
+  }, [file]);
+
+  useEffect(() => {
+    if (!img) return;
+    const swap = rot === 90 || rot === 270;
+    const bw = swap ? img.naturalHeight : img.naturalWidth;
+    const bh = swap ? img.naturalWidth : img.naturalHeight;
+    const base = document.createElement("canvas");
+    base.width = bw; base.height = bh;
+    const ctx = base.getContext("2d");
+    ctx.save();
+    ctx.translate(bw / 2, bh / 2);
+    ctx.rotate((rot * Math.PI) / 180);
+    ctx.drawImage(img, -img.naturalWidth / 2, -img.naturalHeight / 2);
+    ctx.restore();
+    baseRef.current = base;
+    const cw = (wrapRef.current && wrapRef.current.clientWidth) || 320;
+    const maxH = 340;
+    let scale = cw / bw;
+    if (bh * scale > maxH) scale = maxH / bh;
+    const w = Math.round(bw * scale), h = Math.round(bh * scale);
+    setDisp({ w, h, scale });
+    setBox({ x: Math.round(w * 0.08), y: Math.round(h * 0.08), w: Math.round(w * 0.84), h: Math.round(h * 0.84) });
+  }, [img, rot]);
+
+  useEffect(() => {
+    if (!baseRef.current || !viewRef.current || !disp.w) return;
+    const v = viewRef.current;
+    v.width = disp.w; v.height = disp.h;
+    v.getContext("2d").drawImage(baseRef.current, 0, 0, disp.w, disp.h);
+  }, [disp]);
+
+  const onDown = (mode) => (e) => {
+    e.preventDefault(); e.stopPropagation();
+    dragRef.current = { mode, sx: e.clientX, sy: e.clientY, box: { ...box } };
+    const move = (ev) => {
+      const d = dragRef.current; if (!d) return;
+      const dx = ev.clientX - d.sx, dy = ev.clientY - d.sy;
+      let { x, y, w, h } = d.box; const min = 40;
+      if (d.mode === "move") { x += dx; y += dy; }
+      if (d.mode.includes("l")) { x += dx; w -= dx; }
+      if (d.mode.includes("r")) { w += dx; }
+      if (d.mode.includes("t")) { y += dy; h -= dy; }
+      if (d.mode.includes("b")) { h += dy; }
+      if (w < min) { if (d.mode.includes("l")) x = d.box.x + d.box.w - min; w = min; }
+      if (h < min) { if (d.mode.includes("t")) y = d.box.y + d.box.h - min; h = min; }
+      x = Math.max(0, Math.min(x, disp.w - w));
+      y = Math.max(0, Math.min(y, disp.h - h));
+      w = Math.min(w, disp.w - x); h = Math.min(h, disp.h - y);
+      setBox({ x, y, w, h });
+    };
+    const up = () => { dragRef.current = null; window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); };
+    window.addEventListener("pointermove", move);
+    window.addEventListener("pointerup", up);
+  };
+
+  const doScan = () => {
+    const base = baseRef.current; if (!base || !box || busy) return;
+    const sx = box.x / disp.scale, sy = box.y / disp.scale, sw = box.w / disp.scale, sh = box.h / disp.scale;
+    const out = document.createElement("canvas");
+    out.width = Math.max(1, Math.round(sw)); out.height = Math.max(1, Math.round(sh));
+    out.getContext("2d").drawImage(base, sx, sy, sw, sh, 0, 0, out.width, out.height);
+    out.toBlob((blob) => { if (blob) onScan(blob); }, "image/png");
+  };
+
+  const hPos = (m) => ({
+    left: (m.includes("l") ? box.x : box.x + box.w) - 9,
+    top: (m.includes("t") ? box.y : box.y + box.h) - 9,
+  });
+
+  return (
+    <div className="flex flex-col gap-3 pb-2">
+      <button onClick={onCancel} className="flex items-center gap-1 text-sm font-semibold" style={{ color: C.carb }}>
+        <ArrowLeft size={16} /> Back
+      </button>
+      <p className="text-sm" style={{ color: C.sub }}>Rotate if needed, then drag the corners to frame just the nutrition facts.</p>
+      <div ref={wrapRef} className="relative mx-auto overflow-hidden rounded-xl" style={{ width: disp.w || "100%", height: disp.h || 200, background: C.card2, touchAction: "none" }}>
+        <canvas ref={viewRef} className="block" style={{ width: disp.w, height: disp.h }} />
+        {box && (
+          <>
+            <div onPointerDown={onDown("move")} className="absolute"
+              style={{ left: box.x, top: box.y, width: box.w, height: box.h, border: `2px solid ${C.carb}`, boxShadow: "0 0 0 9999px rgba(0,0,0,0.5)", touchAction: "none", cursor: "move" }} />
+            {["tl", "tr", "bl", "br"].map((m) => (
+              <div key={m} onPointerDown={onDown(m)} className="absolute"
+                style={{ ...hPos(m), width: 18, height: 18, background: C.carb, borderRadius: 5, touchAction: "none" }} />
+            ))}
+          </>
+        )}
+      </div>
+      <div className="flex gap-2">
+        <button onClick={() => setRot((r) => (r + 270) % 360)} className="flex h-11 w-11 items-center justify-center rounded-xl" style={{ background: C.card2 }} aria-label="Rotate left"><RotateCcw size={18} color={C.text} /></button>
+        <button onClick={() => setRot((r) => (r + 90) % 360)} className="flex h-11 w-11 items-center justify-center rounded-xl" style={{ background: C.card2 }} aria-label="Rotate right"><RotateCw size={18} color={C.text} /></button>
+        <button onClick={doScan} disabled={busy} className="flex flex-1 items-center justify-center gap-2 rounded-xl font-bold" style={{ background: busy ? C.card2 : C.carb, color: busy ? C.sub : "#1a1100" }}>
+          {busy ? <Loader size={16} className="animate-spin" /> : <Camera size={16} />}{busy ? "Reading…" : "Scan crop"}
+        </button>
+      </div>
+    </div>
+  );
 }
 
 function AddFoodSheet({ meal, customFoods = [], meals = [], onClose, onAdd, onAddMeal, onNewMeal, onRemoveCached }) {
   const [mode, setMode] = useState("search"); // search | custom | barcode
   const [tab, setTab] = useState("foods");    // foods | meals
   const [q, setQ] = useState("");
-  const [custom, setCustom] = useState({ name: "", serving: "", cal: "", p: "", c: "", f: "" });
+  const [custom, setCustom] = useState({ name: "", serving: "", cal: "", p: "", c: "", f: "", fiber: "", sugar: "", sodium: "" });
   const [ocr, setOcr] = useState({ busy: false, msg: "", err: "" });
-  const scanLabel = async (file) => {
-    if (!file) return;
+  const [labelFile, setLabelFile] = useState(null);
+  const runOcr = async (imgSource) => {
+    if (!imgSource) return;
     setOcr({ busy: true, msg: "Reading the label… this can take a few seconds.", err: "" });
     try {
       const T = await loadTesseract();
-      const { data } = await T.recognize(file, "eng");
+      const { data } = await T.recognize(imgSource, "eng");
       const parsed = parseNutritionText(data && data.text);
       const got = parsed.cal || parsed.p || parsed.c || parsed.f;
       setCustom((p) => ({
         ...p,
+        name: parsed.name || p.name,
         serving: parsed.serving || p.serving,
         cal: parsed.cal || p.cal, p: parsed.p || p.p, c: parsed.c || p.c, f: parsed.f || p.f,
+        fiber: parsed.fiber || p.fiber, sugar: parsed.sugar || p.sugar, sodium: parsed.sodium || p.sodium,
       }));
-      setOcr({ busy: false, msg: got ? "Filled in what I could read — double-check the values below." : "", err: got ? "" : "Couldn't read the values. Try a flatter, well-lit photo, or type them in." });
+      setOcr({ busy: false, msg: got ? "Filled in what I could read — double-check the values below." : "", err: got ? "" : "Couldn't read the values. Try re-cropping tighter, or type them in." });
     } catch {
       setOcr({ busy: false, msg: "", err: "Couldn't run the scanner (needs an internet connection). You can still enter values manually." });
     }
@@ -2564,6 +2691,16 @@ function AddFoodSheet({ meal, customFoods = [], meals = [], onClose, onAdd, onAd
     );
   }
 
+  if (mode === "prep" && labelFile) {
+    return (
+      <Sheet title="Crop label" onClose={onClose} accent={C.carb}>
+        <LabelCropper file={labelFile} busy={ocr.busy}
+          onCancel={() => setMode("custom")}
+          onScan={async (blob) => { await runOcr(blob); setMode("custom"); }} />
+      </Sheet>
+    );
+  }
+
   if (mode === "custom") {
     const setF = (k) => (v) => setCustom((p) => ({ ...p, [k]: v }));
     return (
@@ -2577,7 +2714,7 @@ function AddFoodSheet({ meal, customFoods = [], meals = [], onClose, onAdd, onAd
             {ocr.busy ? <Loader size={16} className="animate-spin" /> : <Camera size={16} />}
             {ocr.busy ? "Reading label…" : "Scan nutrition label"}
             <input type="file" accept="image/*" capture="environment" className="hidden" disabled={ocr.busy}
-              onChange={(e) => scanLabel(e.target.files && e.target.files[0])} />
+              onChange={(e) => { const fl = e.target.files && e.target.files[0]; e.target.value = ""; if (fl) { setOcr({ busy: false, msg: "", err: "" }); setLabelFile(fl); setMode("prep"); } }} />
           </label>
           {ocr.msg && <p className="text-xs" style={{ color: C.sub }}>{ocr.msg}</p>}
           {ocr.err && <p className="text-xs font-semibold" style={{ color: C.energy1 }}>{ocr.err}</p>}
@@ -2593,9 +2730,16 @@ function AddFoodSheet({ meal, customFoods = [], meals = [], onClose, onAdd, onAd
             <Labeled label="Carbs"><NumField value={custom.c} onChange={setF("c")} suffix="g" /></Labeled>
             <Labeled label="Fat"><NumField value={custom.f} onChange={setF("f")} suffix="g" /></Labeled>
           </div>
+          <p className="mt-1 text-xs font-bold uppercase tracking-wide" style={{ color: C.faint }}>More (optional)</p>
+          <div className="grid grid-cols-3 gap-2">
+            <Labeled label="Fiber"><NumField value={custom.fiber} onChange={setF("fiber")} suffix="g" /></Labeled>
+            <Labeled label="Sugars"><NumField value={custom.sugar} onChange={setF("sugar")} suffix="g" /></Labeled>
+            <Labeled label="Sodium"><NumField value={custom.sodium} onChange={setF("sodium")} suffix="mg" /></Labeled>
+          </div>
           <button
             onClick={() => onAdd({ name: custom.name || "Food", serving: custom.serving || "1 serving",
               cal: Number(custom.cal) || 0, p: Number(custom.p) || 0, c: Number(custom.c) || 0, f: Number(custom.f) || 0,
+              fiber: Number(custom.fiber) || 0, sugar: Number(custom.sugar) || 0, sodium: Number(custom.sodium) || 0,
               source: "custom", qty: 1 })}
             className="mt-2 rounded-2xl py-3.5 font-bold" style={{ background: C.carb, color: "#1a1100" }}>
             Add to {meal}
