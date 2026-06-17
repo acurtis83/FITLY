@@ -85,6 +85,8 @@ const DEFAULT_SETTINGS = {
   units: "lb",
   goalCalories: 2400, goalProtein: 180, goalCarbs: 250, goalFat: 70,
   goalSets: 18, goalWeight: 175, goalBodyfat: 12, name: "Athlete",
+  goalTrainMin: 45, goalBurn: 500, goalVolume: 12000, goalDistance: 3, goalWorkouts: 1,
+  todayMetrics: ["energy", "protein", "sets"],
 };
 
 const EXERCISES = [
@@ -230,10 +232,64 @@ function sessionFromRoutine(rt) {
 /* ---------- small math helpers ---------- */
 const round = (n, d = 0) => { const m = 10 ** d; return Math.round((n + Number.EPSILON) * m) / m; };
 const epley1RM = (w, r) => (r > 0 ? w * (1 + r / 30) : w);
-const loggedSets = (sets) => sets.filter((s) => Number(s.reps) > 0 && s.weight !== "");
+const loggedSets = (sets) => (sets || []).filter((s) => Number(s.reps) > 0 && s.weight !== "");
+const clock = (sec) => { sec = Math.max(0, Math.round(sec || 0)); return `${Math.floor(sec / 60)}:${String(sec % 60).padStart(2, "0")}`; };
 const sessionVolume = (w) =>
   w.exercises.reduce((t, ex) => t + loggedSets(ex.sets).reduce((s, st) => s + Number(st.weight) * Number(st.reps), 0), 0);
 const sessionSets = (w) => w.exercises.reduce((t, ex) => t + loggedSets(ex.sets).length, 0);
+
+// ---- estimated calories burned (MET method: kcal = MET × kg × hours) ----
+const STRENGTH_MET = 5.0; // general resistance training
+const DEFAULT_CARDIO_MET = 7.0;
+const CARDIO_MET = {
+  "Rowing Machine": 7, "Stationary Bike": 7, "Assault Bike": 8, "Treadmill Run": 9.8,
+  "Treadmill Walk": 3.8, "Incline Walk": 5.5, "Elliptical": 5, "Stair Climber": 9, "Jump Rope": 12,
+};
+// convert a logged bodyweight (in the user's units) to kilograms
+const toKg = (weight, units) => (weight == null ? null : units === "kg" ? weight : weight / 2.2046);
+// latest bodyweight in kg, or null if none logged
+const bodyKgOf = (body, units) => (body && body.length ? toKg(body[body.length - 1].weight, units) : null);
+// average speed (mph) from a cardio entry, or null
+function cardioSpeedMph(c) {
+  if (!c) return null;
+  const dist = Number(c.dist) || 0;
+  const mins = (Number(c.min) || 0) + (Number(c.sec) || 0) / 60;
+  if (dist <= 0 || mins <= 0) return null;
+  const mi = c.unit === "km" ? dist / 1.609344 : dist;
+  return mi / (mins / 60);
+}
+// MET for a cardio exercise, refined by speed + incline when available
+function cardioMET(ex) {
+  const c = ex.cardio;
+  const v = cardioSpeedMph(c);
+  const incl = c ? Number(c.incline || 0) : 0;
+  if (/walk/i.test(ex.name)) return (v ? Math.max(2.5, 2.0 + v * 0.9) : 3.8) + incl * 0.3;
+  if (/run|jog/i.test(ex.name)) return (v ? Math.max(6, 1.65 * v) : 9.8) + incl * 0.4;
+  return CARDIO_MET[ex.name] || DEFAULT_CARDIO_MET;
+}
+// total cardio distance for a workout, in miles
+const cardioDistanceMi = (w) => (w.exercises || []).reduce((t, ex) => {
+  if (ex.muscle !== "Cardio" || !ex.cardio) return t;
+  const d = Number(ex.cardio.dist) || 0;
+  if (!d) return t;
+  return t + (ex.cardio.unit === "km" ? d / 1.609344 : d);
+}, 0);
+// estimate kcal for one workout. totalSec optional (live); else uses w.duration (minutes).
+function workoutCalories(w, kg, totalSecOverride) {
+  if (!kg) return 0;
+  let cardioSec = 0, cardioKcal = 0;
+  (w.exercises || []).forEach((ex) => {
+    if (ex.muscle !== "Cardio") return;
+    const manual = ex.cardio ? (Number(ex.cardio.min || 0) * 60 + Number(ex.cardio.sec || 0)) : 0;
+    const sec = manual || ex.seconds || ex.liveSeconds || 0;
+    if (sec > 0) { cardioKcal += cardioMET(ex) * kg * (sec / 3600); cardioSec += sec; }
+  });
+  const totalSec = totalSecOverride != null ? totalSecOverride : (w.duration || 0) * 60;
+  let strengthSec = Math.max(0, totalSec - cardioSec);
+  if (totalSec <= 0 && cardioSec === 0) strengthSec = sessionSets(w) * 48; // no timing at all
+  return Math.round(cardioKcal + STRENGTH_MET * kg * (strengthSec / 3600));
+}
+
 
 /* ============================================================
    Progress meters — modern vertical gradient towers
@@ -247,8 +303,8 @@ function ProgressTowers({ items, height = 156 }) {
         const over = ratio >= 1;
         return (
           <div key={it.label} className="flex flex-1 flex-col items-center gap-2">
-            <span className="font-bold" style={{ fontSize: 22, lineHeight: 1, color: it.c1 }}>{it.value}</span>
-            <span className="text-xs font-semibold" style={{ color: C.faint }}>/ {it.goal} {it.unit}</span>
+            <span className="font-bold" style={{ fontSize: 22, lineHeight: 1, color: it.c1 }}>{it.vdisp ?? it.value}</span>
+            <span className="text-xs font-semibold" style={{ color: C.faint }}>/ {it.gdisp ?? it.goal} {it.unit}</span>
             <div className="relative w-full overflow-hidden rounded-2xl" style={{ height, background: C.card2 }}>
               <div className="absolute inset-x-0" style={{ top: "25%", height: 1, background: "rgba(255,255,255,0.06)" }} />
               <div className="absolute inset-x-0" style={{ top: "50%", height: 1, background: "rgba(255,255,255,0.06)" }} />
@@ -265,8 +321,36 @@ function ProgressTowers({ items, height = 156 }) {
 }
 
 /* ============================================================
-   FITLY logo
+   Today hero — customizable metrics
    ============================================================ */
+const TODAY_METRICS = [
+  { id: "energy", label: "Energy", goalKey: "goalCalories", unit: "cal", c0: C.energy0, c1: C.energy1, icon: <Flame size={13} color={C.energy1} /> },
+  { id: "protein", label: "Protein", goalKey: "goalProtein", unit: "g", c0: C.protein0, c1: C.protein1, icon: <Apple size={13} color={C.protein1} /> },
+  { id: "carbs", label: "Carbs", goalKey: "goalCarbs", unit: "g", c0: "#C77400", c1: C.carb, icon: <Activity size={13} color={C.carb} /> },
+  { id: "fat", label: "Fat", goalKey: "goalFat", unit: "g", c0: "#C7A800", c1: C.fat, icon: <Activity size={13} color={C.fat} /> },
+  { id: "sets", label: "Training", goalKey: "goalSets", unit: "sets", c0: C.train0, c1: C.train1, icon: <Dumbbell size={13} color={C.train1} /> },
+  { id: "volume", label: "Volume", goalKey: "goalVolume", unit: "vol", c0: C.train0, c1: C.train1, icon: <BarChart3 size={13} color={C.train1} /> },
+  { id: "burned", label: "Burned", goalKey: "goalBurn", unit: "cal", c0: C.energy0, c1: C.energy1, icon: <Flame size={13} color={C.energy1} /> },
+  { id: "time", label: "Time", goalKey: "goalTrainMin", unit: "min", c0: C.train0, c1: C.train1, icon: <Clock size={13} color={C.train1} /> },
+  { id: "distance", label: "Distance", goalKey: "goalDistance", unit: "mi", c0: C.train0, c1: C.train1, icon: <TrendingUp size={13} color={C.train1} /> },
+  { id: "workouts", label: "Workouts", goalKey: "goalWorkouts", unit: "", c0: C.train0, c1: C.train1, icon: <Trophy size={13} color={C.train1} /> },
+];
+const metricDef = (id) => TODAY_METRICS.find((m) => m.id === id);
+function buildTodayItems(ids, ctx, settings, u) {
+  return (ids || []).map((id) => {
+    const d = metricDef(id);
+    if (!d) return null;
+    const value = ctx[id] || 0;
+    const goal = Number(settings[d.goalKey]) || 0;
+    const unit = id === "volume" ? u : d.unit;
+    let vdisp, gdisp;
+    if (id === "distance") { vdisp = value.toFixed(1); gdisp = goal; }
+    else if (id === "volume") { vdisp = Math.round(value).toLocaleString(); gdisp = goal.toLocaleString(); }
+    else { vdisp = Math.round(value).toLocaleString(); gdisp = goal; }
+    return { id, label: d.label, value, goal, unit, c0: d.c0, c1: d.c1, icon: d.icon, vdisp, gdisp };
+  }).filter(Boolean);
+}
+
 function LogoMark({ size = 36 }) {
   return (
     <svg width={size} height={size} viewBox="0 0 100 100">
@@ -350,9 +434,212 @@ function Sheet({ title, onClose, children, accent = C.energy1 }) {
   );
 }
 
+function WorkoutDetailSheet({ workout, u, bodyKg, onClose, onSave, onDelete, onOpenExercise }) {
+  const [draft, setDraft] = useState(() => structuredClone(workout));
+  const [editing, setEditing] = useState(false);
+  const [confirmDel, setConfirmDel] = useState(false);
+
+  const mut = (fn) => setDraft((d) => { const n = structuredClone(d); fn(n); return n; });
+  const setField = (k, v) => setDraft((d) => ({ ...d, [k]: v }));
+  const setSet = (ei, si, f, v) => mut((d) => { d.exercises[ei].sets[si][f] = v; });
+  const addSet = (ei) => mut((d) => { const s = d.exercises[ei].sets; const last = s[s.length - 1]; s.push({ weight: last ? last.weight : "", reps: last ? last.reps : "", done: true }); });
+  const delSet = (ei, si) => mut((d) => { d.exercises[ei].sets.splice(si, 1); });
+  const delEx = (ei) => mut((d) => { d.exercises.splice(ei, 1); });
+  const setCardio = (ei, f, v) => mut((d) => { d.exercises[ei].cardio = { dist: "", unit: "mi", min: "", sec: "", incline: "", ...(d.exercises[ei].cardio || {}), [f]: v }; });
+
+  const dur = Number(draft.duration) || 0;
+  const restS = draft.restSeconds || 0;
+  const workS = Math.max(0, dur * 60 - restS);
+  const density = dur * 60 > 0 && restS > 0 ? Math.round((workS / (dur * 60)) * 100) : null;
+  const ratio = restS > 0 ? (workS / restS).toFixed(1) : null;
+  const dist = cardioDistanceMi(draft);
+  const cal = bodyKg ? workoutCalories(draft, bodyKg) : null;
+
+  const save = () => { onSave({ ...draft, duration: Number(draft.duration) || 0 }); setEditing(false); };
+
+  return (
+    <Sheet title={editing ? "Edit workout" : "Workout"} onClose={onClose} accent={C.train1}>
+      {/* name + date */}
+      {editing ? (
+        <div className="flex flex-col gap-2">
+          <input value={draft.name} onChange={(e) => setField("name", e.target.value)}
+            className="rounded-xl px-3 py-2 text-lg font-bold outline-none" style={{ background: C.card2, color: C.text }} />
+          <div className="flex items-center gap-2">
+            <input type="date" value={draft.date} max={today()} onChange={(e) => setField("date", e.target.value)}
+              className="flex-1 rounded-xl px-3 py-2 text-sm font-semibold outline-none" style={{ background: C.card2, color: C.text, colorScheme: "dark" }} />
+            <div className="w-28"><NumField value={String(draft.duration ?? "")} onChange={(v) => setField("duration", v)} suffix="min" /></div>
+          </div>
+        </div>
+      ) : (
+        <div>
+          <h2 className="text-2xl font-bold" style={{ letterSpacing: "-0.5px" }}>{draft.name}</h2>
+          <p className="text-sm font-semibold" style={{ color: C.sub }}>{fmtDay(draft.date)}</p>
+        </div>
+      )}
+
+      {/* stat grid */}
+      <div className="mt-4 grid grid-cols-2 gap-3">
+        <Card className="p-3"><Stat label="Duration" value={dur} unit="min" color={C.train1} /></Card>
+        <Card className="p-3"><Stat label="Volume" value={round(sessionVolume(draft)).toLocaleString()} unit={u} color={C.protein1} /></Card>
+        <Card className="p-3"><Stat label="Sets" value={sessionSets(draft)} color={C.protein1} /></Card>
+        {dist > 0 && <Card className="p-3"><Stat label="Distance" value={dist.toFixed(2)} unit="mi" color={C.train1} /></Card>}
+        {cal != null && <Card className="p-3"><Stat label="Est. cal" value={cal.toLocaleString()} color={C.energy1} /></Card>}
+        {restS > 0 && <Card className="p-3"><Stat label="Work time" value={clock(workS)} color={C.protein1} /></Card>}
+        {restS > 0 && <Card className="p-3"><Stat label="Rest time" value={clock(restS)} color={C.carb} /></Card>}
+        {density != null && <Card className="p-3"><Stat label="Effort" value={`${density}%`} color={C.energy1} /></Card>}
+      </div>
+      {ratio && <p className="mt-2 text-xs" style={{ color: C.faint }}>Work-to-rest ratio {ratio} : 1 — share of the session spent working vs. resting.</p>}
+
+      {/* exercises */}
+      <div className="mt-4 flex flex-col gap-3">
+        {draft.exercises.map((ex, ei) => {
+          const isCardio = ex.muscle === "Cardio";
+          const c = ex.cardio || {};
+          const ls = loggedSets(ex.sets);
+          const spd = isCardio ? cardioSpeedMph(c) : null;
+          const totMin = (Number(c.min) || 0) + (Number(c.sec) || 0) / 60;
+          const distEx = Number(c.dist) || 0;
+          const paceMin = distEx > 0 && totMin > 0 ? totMin / distEx : null;
+          const pace = paceMin ? `${Math.floor(paceMin)}:${String(Math.round((paceMin % 1) * 60)).padStart(2, "0")}` : null;
+          return (
+            <Card key={ex.id || ei} className="p-4">
+              <div className="mb-2 flex items-center justify-between gap-2">
+                <button onClick={() => !editing && onOpenExercise(ex.name)} className="min-w-0 flex-1 text-left">
+                  <p className="truncate font-bold">{ex.name}</p>
+                  <p className="truncate text-xs" style={{ color: C.sub }}>{ex.muscle}{ex.seconds ? ` · ${clock(ex.seconds)}` : ""}</p>
+                </button>
+                {editing && <button onClick={() => delEx(ei)} className="p-1"><Trash2 size={15} color={C.faint} /></button>}
+              </div>
+
+              {isCardio ? (
+                editing ? (
+                  <div className="flex flex-col gap-2">
+                    <div className="flex items-end gap-2">
+                      <div className="flex-1"><p className="mb-1 text-xs font-semibold" style={{ color: C.faint }}>DISTANCE</p><NumField value={c.dist ?? ""} onChange={(v) => setCardio(ei, "dist", v)} placeholder="0" /></div>
+                      <div className="mb-0.5 flex rounded-xl p-1" style={{ background: C.card2 }}>
+                        {["mi", "km"].map((un) => (<button key={un} onClick={() => setCardio(ei, "unit", un)} className="rounded-lg px-2.5 py-1 text-xs font-bold" style={{ background: (c.unit || "mi") === un ? C.train1 : "transparent", color: (c.unit || "mi") === un ? "#001012" : C.sub }}>{un}</button>))}
+                      </div>
+                    </div>
+                    <div className="flex items-end gap-2">
+                      <div className="flex-1"><p className="mb-1 text-xs font-semibold" style={{ color: C.faint }}>TIME (MIN : SEC)</p><div className="flex items-center gap-1"><NumField value={c.min ?? ""} onChange={(v) => setCardio(ei, "min", v)} placeholder="0" /><span style={{ color: C.faint }}>:</span><NumField value={c.sec ?? ""} onChange={(v) => setCardio(ei, "sec", v)} placeholder="00" /></div></div>
+                      <div className="w-20"><p className="mb-1 text-xs font-semibold" style={{ color: C.faint }}>INCLINE %</p><NumField value={c.incline ?? ""} onChange={(v) => setCardio(ei, "incline", v)} placeholder="0" /></div>
+                    </div>
+                  </div>
+                ) : (
+                  <p className="text-sm font-semibold" style={{ color: C.sub }}>
+                    {distEx > 0 ? `${distEx} ${c.unit || "mi"}` : "—"}{totMin > 0 ? ` · ${clock(totMin * 60)}` : ""}{pace ? ` · ${pace}/${c.unit || "mi"}` : ""}{Number(c.incline) > 0 ? ` · ${c.incline}% incline` : ""}
+                  </p>
+                )
+              ) : editing ? (
+                <div className="flex flex-col gap-1.5">
+                  {ex.sets.map((st, si) => (
+                    <div key={si} className="flex items-center gap-2">
+                      <span className="w-6 text-center text-sm font-bold" style={{ color: C.sub }}>{si + 1}</span>
+                      <div className="flex-1"><NumField value={st.weight} onChange={(v) => setSet(ei, si, "weight", v)} placeholder="0" suffix={u} /></div>
+                      <div className="flex-1"><NumField value={st.reps} onChange={(v) => setSet(ei, si, "reps", v)} placeholder="0" suffix="reps" /></div>
+                      <button onClick={() => delSet(ei, si)} className="w-5"><X size={14} color={C.faint} /></button>
+                    </div>
+                  ))}
+                  <button onClick={() => addSet(ei)} className="mt-1 w-full rounded-xl py-2 text-sm font-semibold" style={{ background: C.card2, color: C.train1 }}>+ Add Set</button>
+                </div>
+              ) : (
+                <div className="flex flex-col gap-1">
+                  {ls.length === 0 && <p className="text-sm" style={{ color: C.faint }}>No sets logged.</p>}
+                  {ls.map((st, si) => (
+                    <div key={si} className="flex items-center gap-3 text-sm">
+                      <span className="w-6 text-center font-bold" style={{ color: C.faint }}>{si + 1}</span>
+                      <span className="font-semibold" style={{ color: C.text }}>{st.weight} {u}</span>
+                      <span style={{ color: C.faint }}>×</span>
+                      <span className="font-semibold" style={{ color: C.text }}>{st.reps} reps</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </Card>
+          );
+        })}
+      </div>
+
+      {/* actions */}
+      <div className="mt-5 flex items-center gap-2">
+        {editing ? (
+          <>
+            <button onClick={() => { setDraft(structuredClone(workout)); setEditing(false); }} className="flex-1 rounded-2xl py-3 font-bold" style={{ background: C.card2, color: C.sub }}>Cancel</button>
+            <button onClick={save} className="flex-1 rounded-2xl py-3 font-bold" style={{ background: C.protein1, color: "#06210A" }}>Save changes</button>
+          </>
+        ) : (
+          <>
+            <button onClick={() => setEditing(true)} className="flex flex-1 items-center justify-center gap-2 rounded-2xl py-3 font-bold" style={{ background: C.train1, color: "#001012" }}><Pencil size={16} /> Edit</button>
+            <button onClick={() => { if (confirmDel) onDelete(); else { setConfirmDel(true); setTimeout(() => setConfirmDel(false), 2500); } }}
+              className="rounded-2xl px-4 py-3 font-bold" style={{ background: C.card2, color: C.energy1 }}>{confirmDel ? "Tap to confirm" : <Trash2 size={16} />}</button>
+          </>
+        )}
+      </div>
+    </Sheet>
+  );
+}
+
 /* ============================================================
    APP
    ============================================================ */
+function CustomizeTodaySheet({ settings, setSettings, u, onClose }) {
+  const initial = settings.todayMetrics && settings.todayMetrics.length ? settings.todayMetrics.slice(0, 3) : ["energy", "protein", "sets"];
+  const [sel, setSel] = useState(initial);
+  const [goals, setGoals] = useState(() => { const g = {}; TODAY_METRICS.forEach((m) => (g[m.goalKey] = settings[m.goalKey])); return g; });
+  const toggle = (id) => setSel((cur) => (cur.includes(id) ? cur.filter((x) => x !== id) : cur.length >= 3 ? cur : [...cur, id]));
+  const move = (id, dir) => setSel((cur) => {
+    const i = cur.indexOf(id), j = i + dir;
+    if (i < 0 || j < 0 || j >= cur.length) return cur;
+    const n = [...cur]; [n[i], n[j]] = [n[j], n[i]]; return n;
+  });
+  const setGoal = (key, v) => setGoals((g) => ({ ...g, [key]: v === "" ? "" : Number(v) }));
+  const save = () => {
+    const cleaned = {}; Object.keys(goals).forEach((k) => (cleaned[k] = goals[k] === "" ? 0 : goals[k]));
+    setSettings((p) => ({ ...p, ...cleaned, todayMetrics: sel.length ? sel : ["energy", "protein", "sets"] }));
+    onClose();
+  };
+  return (
+    <Sheet title="Customize progress" onClose={onClose} accent={C.train1}>
+      <p className="mb-3 text-sm" style={{ color: C.sub }}>Choose up to 3 metrics for your Today hero and set each goal. {sel.length}/3 selected.</p>
+      <div className="flex flex-col gap-2">
+        {TODAY_METRICS.map((m) => {
+          const on = sel.includes(m.id);
+          const idx = sel.indexOf(m.id);
+          const unit = m.id === "volume" ? u : m.unit;
+          return (
+            <div key={m.id} className="rounded-2xl p-3" style={{ background: on ? "rgba(0,240,200,0.10)" : C.card2 }}>
+              <div className="flex items-center gap-2">
+                <button onClick={() => toggle(m.id)} className="flex min-w-0 flex-1 items-center gap-2 text-left">
+                  <span className="flex h-7 w-7 items-center justify-center rounded-full" style={{ background: C.card }}>{m.icon}</span>
+                  <span className="font-bold">{m.label}</span>
+                  {on && <span className="rounded-full px-1.5 text-xs font-bold" style={{ background: C.train1, color: "#001012" }}>#{idx + 1}</span>}
+                </button>
+                {on && (
+                  <div className="flex items-center gap-1">
+                    <button onClick={() => move(m.id, -1)} disabled={idx === 0} className="p-1" style={{ opacity: idx === 0 ? 0.3 : 1 }}><ChevronLeft size={16} color={C.sub} /></button>
+                    <button onClick={() => move(m.id, 1)} disabled={idx === sel.length - 1} className="p-1" style={{ opacity: idx === sel.length - 1 ? 0.3 : 1 }}><ChevronRight size={16} color={C.sub} /></button>
+                  </div>
+                )}
+                <button onClick={() => toggle(m.id)} className="flex h-7 w-7 items-center justify-center rounded-full" style={{ background: on ? C.train1 : C.card3 }}>
+                  {on ? <Check size={15} color="#001012" strokeWidth={3} /> : <Plus size={15} color={C.sub} />}
+                </button>
+              </div>
+              {on && (
+                <div className="mt-2 flex items-center gap-2 pl-9">
+                  <span className="text-xs font-semibold" style={{ color: C.faint }}>Daily goal</span>
+                  <div className="w-32"><NumField value={String(goals[m.goalKey] ?? "")} onChange={(v) => setGoal(m.goalKey, v)} suffix={unit} /></div>
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+      <button onClick={save} className="mt-4 w-full rounded-2xl py-3.5 font-bold" style={{ background: C.protein1, color: "#06210A" }}>Save</button>
+    </Sheet>
+  );
+}
+
+
 export default function App() {
   const [hydrated, setHydrated] = useState(false);
   const [tab, setTab] = useState("today");
@@ -483,6 +770,7 @@ export default function App() {
             ringEnergy={ringEnergy} ringProtein={ringProtein} ringTrain={ringTrain}
             daySetCount={daySetCount} dayVolume={dayVolume} dayWorkouts={dayWorkouts}
             body={body} active={active} onOpenSettings={() => setModal({ type: "settings" })}
+            onCustomize={() => setModal({ type: "customizeToday" })}
             goTrain={() => setTab("workout")} goFood={() => setTab("food")}
             onLogWeight={() => setModal({ type: "addBody" })}
             plannedRoutine={plannedRoutine} activeProg={activeProg}
@@ -494,7 +782,7 @@ export default function App() {
             ? <ExerciseProgress name={exDetail} history={exHistory[exDetail] || []} u={u} onBack={() => setExDetail(null)} />
             : <WorkoutView
                 active={active} setActive={setActive} routines={routines} workouts={workouts}
-                u={u} exHistory={exHistory}
+                u={u} exHistory={exHistory} bodyKg={bodyKgOf(body, settings.units)}
                 programs={programs} activeProgram={activeProgram}
                 startRoutineById={startRoutineById}
                 onPickExercise={(cb) => setModal({ type: "pickExercise", cb })}
@@ -506,6 +794,7 @@ export default function App() {
                 onDeleteProgram={deleteProgram}
                 onSetActiveProgram={(id) => setActiveProgram((cur) => (cur === id ? null : id))}
                 onSaveWorkout={saveActive} onOpenExercise={(n) => setExDetail(n)}
+                onOpenWorkout={(id) => setModal({ type: "workoutDetail", id })}
                 onDeleteWorkout={(id) => setWorkouts((p) => p.filter((w) => w.id !== id))}
               />
         )}
@@ -548,6 +837,9 @@ export default function App() {
       {modal?.type === "settings" && (
         <SettingsSheet settings={settings} setSettings={setSettings} onClose={() => setModal(null)} />
       )}
+      {modal?.type === "customizeToday" && (
+        <CustomizeTodaySheet settings={settings} setSettings={setSettings} u={u} onClose={() => setModal(null)} />
+      )}
       {modal?.type === "addFood" && (
         <AddFoodSheet meal={modal.meal} customFoods={customFoods} meals={meals}
           onClose={() => setModal(null)}
@@ -583,6 +875,16 @@ export default function App() {
         <AddBodySheet u={u} last={body[body.length - 1]} onClose={() => setModal(null)}
           onSave={(entry) => { upsertBody(entry); setModal(null); }} />
       )}
+      {modal?.type === "workoutDetail" && (() => {
+        const w = workouts.find((x) => x.id === modal.id);
+        if (!w) return null;
+        return (
+          <WorkoutDetailSheet workout={w} u={u} bodyKg={bodyKgOf(body, settings.units)} onClose={() => setModal(null)}
+            onSave={(updated) => { setWorkouts((p) => p.map((x) => (x.id === updated.id ? updated : x))); }}
+            onDelete={() => { setWorkouts((p) => p.filter((x) => x.id !== modal.id)); setModal(null); }}
+            onOpenExercise={(n) => { setModal(null); setExDetail(n); }} />
+        );
+      })()}
       {modal?.type === "pickExercise" && (
         <ExercisePickerSheet onClose={() => setModal(null)} onPick={(ex) => { modal.cb(ex); setModal(null); }} />
       )}
@@ -704,8 +1006,22 @@ function DateNav({ date, setDate }) {
   );
 }
 
-function TodayView({ date, setDate, settings, nutri, ringEnergy, ringProtein, ringTrain, daySetCount, dayVolume, dayWorkouts, body, active, onOpenSettings, goTrain, goFood, onLogWeight, plannedRoutine, activeProg, onStartPlanned }) {
+function TodayView({ date, setDate, settings, nutri, ringEnergy, ringProtein, ringTrain, daySetCount, dayVolume, dayWorkouts, body, active, onOpenSettings, onCustomize, goTrain, goFood, onLogWeight, plannedRoutine, activeProg, onStartPlanned }) {
   const last = body[body.length - 1];
+  const bodyKg = bodyKgOf(body, settings.units);
+  const u = settings.units;
+  const dayBurned = dayWorkouts.reduce((t, w) => t + workoutCalories(w, bodyKg), 0);
+  const dayTime = dayWorkouts.reduce((t, w) => t + (Number(w.duration) || 0), 0);
+  const dayDist = dayWorkouts.reduce((t, w) => t + cardioDistanceMi(w), 0);
+  const metricCtx = {
+    energy: nutri.cal, protein: nutri.p, carbs: nutri.c, fat: nutri.f,
+    sets: daySetCount, volume: dayVolume, burned: dayBurned, time: dayTime, distance: dayDist,
+    workouts: dayWorkouts.length,
+  };
+  const heroItems = buildTodayItems(
+    settings.todayMetrics && settings.todayMetrics.length ? settings.todayMetrics : ["energy", "protein", "sets"],
+    metricCtx, settings, u
+  );
   return (
     <div className="flex flex-col gap-4">
       <div className="flex items-center justify-between pt-1">
@@ -721,14 +1037,15 @@ function TodayView({ date, setDate, settings, nutri, ringEnergy, ringProtein, ri
 
       <DateNav date={date} setDate={setDate} />
 
-      {/* Hero — daily progress */}
+      {/* Hero — daily progress (customizable) */}
       <Card className="p-5">
-        <p className="mb-3 text-xs font-bold uppercase tracking-wide" style={{ color: C.sub }}>Today's progress</p>
-        <ProgressTowers items={[
-          { label: "Energy", value: nutri.cal, goal: settings.goalCalories, unit: "cal", c0: C.energy0, c1: C.energy1, icon: <Flame size={13} color={C.energy1} /> },
-          { label: "Protein", value: nutri.p, goal: settings.goalProtein, unit: "g", c0: C.protein0, c1: C.protein1, icon: <Apple size={13} color={C.protein1} /> },
-          { label: "Training", value: daySetCount, goal: settings.goalSets, unit: "sets", c0: C.train0, c1: C.train1, icon: <Dumbbell size={13} color={C.train1} /> },
-        ]} />
+        <div className="mb-3 flex items-center justify-between">
+          <p className="text-xs font-bold uppercase tracking-wide" style={{ color: C.sub }}>Today's progress</p>
+          <button onClick={onCustomize} className="flex items-center gap-1 rounded-full px-2.5 py-1" style={{ background: C.card2 }}>
+            <Pencil size={12} color={C.train1} /><span className="text-xs font-bold" style={{ color: C.train1 }}>Edit</span>
+          </button>
+        </div>
+        <ProgressTowers items={heroItems} />
       </Card>
 
       {/* Macro mini cards */}
@@ -777,7 +1094,7 @@ function TodayView({ date, setDate, settings, nutri, ringEnergy, ringProtein, ri
           : dayWorkouts.map((w) => (
             <div key={w.id} className="flex items-center justify-between border-t py-2" style={{ borderColor: C.line }}>
               <div><p className="font-semibold">{w.name}</p>
-                <p className="text-xs" style={{ color: C.sub }}>{w.exercises.length} exercises · {sessionSets(w)} sets · {w.duration || 0} min</p></div>
+                <p className="text-xs" style={{ color: C.sub }}>{w.exercises.length} exercises · {sessionSets(w)} sets · {w.duration || 0} min{cardioDistanceMi(w) > 0 ? ` · ${cardioDistanceMi(w).toFixed(2)} mi` : ""}{bodyKg ? ` · ~${workoutCalories(w, bodyKg)} cal` : ""}</p></div>
               <Trophy size={18} color={C.protein1} />
             </div>
           ))}
@@ -835,13 +1152,23 @@ function MacroMini({ label, val, goal, color }) {
 /* ============================================================
    WORKOUT  (routines + active session)
    ============================================================ */
-function WorkoutView({ active, setActive, routines, workouts, u, exHistory, programs, activeProgram, startRoutineById, onPickExercise, onNewRoutine, onEditRoutine, onDeleteRoutine, onNewProgram, onEditProgram, onDeleteProgram, onSetActiveProgram, onSaveWorkout, onOpenExercise, onDeleteWorkout }) {
+function WorkoutView({ active, setActive, routines, workouts, u, exHistory, bodyKg, programs, activeProgram, startRoutineById, onPickExercise, onNewRoutine, onEditRoutine, onDeleteRoutine, onNewProgram, onEditProgram, onDeleteProgram, onSetActiveProgram, onSaveWorkout, onOpenExercise, onOpenWorkout, onDeleteWorkout }) {
   if (active) {
-    return <ActiveWorkout active={active} setActive={setActive} u={u} exHistory={exHistory}
+    return <ActiveWorkout active={active} setActive={setActive} u={u} exHistory={exHistory} bodyKg={bodyKg}
       onPickExercise={onPickExercise} onSave={onSaveWorkout} />;
   }
   const startEmpty = () => setActive({ id: "w-" + Date.now(), name: "Quick Workout", startTime: Date.now(), exercises: [] });
-  const recent = [...workouts].reverse().slice(0, 8);
+  const [histQuery, setHistQuery] = useState("");
+  const [histRange, setHistRange] = useState("all"); // all | 30 | 7
+  const ql = histQuery.trim().toLowerCase();
+  const histCutoff = histRange === "all" ? null : addDays(today(), -Number(histRange));
+  const histMatches = [...workouts].reverse().filter((w) => {
+    if (histCutoff && w.date < histCutoff) return false;
+    if (!ql) return true;
+    return w.name.toLowerCase().includes(ql) || w.exercises.some((ex) => ex.name.toLowerCase().includes(ql));
+  });
+  const histFiltering = ql !== "" || histRange !== "all";
+  const recent = histFiltering ? histMatches : histMatches.slice(0, 8);
   const activeProg = programs.find((p) => p.id === activeProgram) || null;
 
   return (
@@ -902,40 +1229,77 @@ function WorkoutView({ active, setActive, routines, workouts, u, exHistory, prog
       </div>
 
       <h3 className="mt-1 font-bold">History</h3>
-      {recent.length === 0 && <p className="text-sm" style={{ color: C.sub }}>Your completed workouts will show up here.</p>}
+      {workouts.length === 0 ? (
+        <p className="text-sm" style={{ color: C.sub }}>Your completed workouts will show up here.</p>
+      ) : (
+        <>
+          <div className="flex items-center gap-2 rounded-2xl px-3" style={{ background: C.card }}>
+            <Search size={16} color={C.faint} />
+            <input value={histQuery} onChange={(e) => setHistQuery(e.target.value)} placeholder="Search workout or exercise"
+              className="w-full bg-transparent py-2.5 text-sm font-semibold outline-none" style={{ color: C.text }} />
+            {histQuery && <button onClick={() => setHistQuery("")} className="p-0.5"><X size={15} color={C.faint} /></button>}
+          </div>
+          <div className="flex items-center gap-2">
+            {[["all", "All time"], ["30", "30 days"], ["7", "7 days"]].map(([v, lbl]) => (
+              <button key={v} onClick={() => setHistRange(v)} className="flex-1 rounded-full py-1.5 text-xs font-bold"
+                style={{ background: histRange === v ? C.train1 : C.card2, color: histRange === v ? "#001012" : C.sub }}>{lbl}</button>
+            ))}
+          </div>
+          {histFiltering && (
+            <p className="text-xs font-semibold" style={{ color: C.faint }}>
+              {recent.length === 0 ? "No matching workouts" : `${recent.length} workout${recent.length === 1 ? "" : "s"}`}
+            </p>
+          )}
+        </>
+      )}
       <div className="flex flex-col gap-3">
-        {recent.map((w) => (
-          <Card key={w.id} className="p-4">
-            <div className="flex items-start justify-between">
-              <div className="flex-1">
-                <p className="font-bold">{w.name}</p>
-                <p className="text-xs" style={{ color: C.sub }}>{fmtDay(w.date)} · {sessionSets(w)} sets · {round(sessionVolume(w)).toLocaleString()} {u}</p>
-                <div className="mt-2 flex flex-wrap gap-1.5">
-                  {w.exercises.map((ex) => (
-                    <button key={ex.id} onClick={() => onOpenExercise(ex.name)}
-                      className="rounded-full px-2.5 py-1 text-xs font-medium" style={{ background: C.card2, color: C.sub }}>
-                      {ex.name}
-                    </button>
-                  ))}
+        {recent.map((w) => {
+          const dur = w.duration || 0;
+          const restS = w.restSeconds || 0;
+          const workS = Math.max(0, dur * 60 - restS);
+          const density = dur * 60 > 0 && restS > 0 ? Math.round((workS / (dur * 60)) * 100) : null;
+          return (
+            <Card key={w.id} className="p-4">
+              <div className="flex items-start justify-between gap-2">
+                <button onClick={() => onOpenWorkout(w.id)} className="min-w-0 flex-1 text-left">
+                  <p className="font-bold">{w.name}</p>
+                  <p className="text-xs" style={{ color: C.sub }}>{fmtDay(w.date)} · {sessionSets(w)} sets · {round(sessionVolume(w)).toLocaleString()} {u}{cardioDistanceMi(w) > 0 ? ` · ${cardioDistanceMi(w).toFixed(2)} mi` : ""}{bodyKg ? ` · ~${workoutCalories(w, bodyKg)} cal` : ""}</p>
+                  <p className="mt-0.5 text-xs" style={{ color: C.faint }}>{dur} min{restS > 0 ? ` · rest ${clock(restS)} · ${density}% effort` : ""}</p>
+                </button>
+                <div className="flex items-center gap-1">
+                  <button onClick={() => onOpenWorkout(w.id)} className="p-1"><ChevronRight size={18} color={C.faint} /></button>
+                  <button onClick={() => onDeleteWorkout(w.id)} className="p-1"><Trash2 size={16} color={C.faint} /></button>
                 </div>
               </div>
-              <button onClick={() => onDeleteWorkout(w.id)} className="p-1"><Trash2 size={16} color={C.faint} /></button>
-            </div>
-          </Card>
-        ))}
+              <div className="mt-2 flex flex-wrap gap-1.5">
+                {w.exercises.map((ex) => (
+                  <button key={ex.id} onClick={() => onOpenExercise(ex.name)}
+                    className="rounded-full px-2.5 py-1 text-xs font-medium" style={{ background: C.card2, color: C.sub }}>
+                    {ex.name}
+                  </button>
+                ))}
+              </div>
+            </Card>
+          );
+        })}
       </div>
+      {!histFiltering && workouts.length > recent.length && (
+        <p className="text-center text-xs" style={{ color: C.faint }}>Showing 8 most recent · search or filter to see all {workouts.length}</p>
+      )}
     </div>
   );
 }
 
-function ActiveWorkout({ active, setActive, u, exHistory, onPickExercise, onSave }) {
+function ActiveWorkout({ active, setActive, u, exHistory, bodyKg, onPickExercise, onSave }) {
   const [rest, setRest] = useState(null); // {remaining, total}
   const timerRef = useRef(null);
+  const restActiveRef = useRef(false);
   const [elapsed, setElapsed] = useState(0);
   const [confirmDiscard, setConfirmDiscard] = useState(false);
   const lastTickRef = useRef(Date.now());
   const [soundOn, setSoundOn] = useState(true);
   const audioRef = useRef(null);
+  const warmedRef = useRef(false);
 
   const ensureAudio = () => {
     try {
@@ -943,13 +1307,23 @@ function ActiveWorkout({ active, setActive, u, exHistory, onPickExercise, onSave
         const AC = window.AudioContext || window.webkitAudioContext;
         if (AC) audioRef.current = new AC();
       }
-      if (audioRef.current && audioRef.current.state === "suspended") audioRef.current.resume();
+      const ctx = audioRef.current;
+      if (!ctx) return;
+      if (ctx.state === "suspended") ctx.resume();
+      // warm-up: play one silent sample so iOS fully unlocks the audio output
+      if (!warmedRef.current) {
+        const buf = ctx.createBuffer(1, 1, 22050);
+        const src = ctx.createBufferSource();
+        src.buffer = buf; src.connect(ctx.destination); src.start(0);
+        warmedRef.current = true;
+      }
     } catch { /* audio unsupported */ }
   };
   const beep = (freq, dur = 0.12, vol = 0.18, type = "sine") => {
     const ctx = audioRef.current;
     if (!ctx) return;
     try {
+      if (ctx.state === "suspended") ctx.resume(); // in case it was suspended while waiting
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.type = type; osc.frequency.value = freq;
@@ -962,11 +1336,22 @@ function ActiveWorkout({ active, setActive, u, exHistory, onPickExercise, onSave
     } catch { /* ignore */ }
   };
 
+  // unlock audio on the very first interaction anywhere in the workout
+  useEffect(() => {
+    const unlock = () => ensureAudio();
+    window.addEventListener("pointerdown", unlock, { once: true });
+    window.addEventListener("touchend", unlock, { once: true });
+    return () => {
+      window.removeEventListener("pointerdown", unlock);
+      window.removeEventListener("touchend", unlock);
+    };
+  }, []);
+
   const restLen = active.restLen ?? 90;
   const exSeconds = active.exSeconds || {};
   const activeExId = active.activeExId || null;
 
-  // master tick: total elapsed + accrue real time to the focused exercise
+  // master tick: total elapsed + accrue real time to the focused exercise + timed rest
   useEffect(() => {
     lastTickRef.current = Date.now();
     const t = setInterval(() => {
@@ -975,10 +1360,15 @@ function ActiveWorkout({ active, setActive, u, exHistory, onPickExercise, onSave
       lastTickRef.current = now;
       setElapsed(Math.round((now - active.startTime) / 1000));
       setActive((prev) => {
-        if (!prev || !prev.activeExId) return prev;
-        const es = { ...(prev.exSeconds || {}) };
-        es[prev.activeExId] = (es[prev.activeExId] || 0) + delta;
-        return { ...prev, exSeconds: es };
+        if (!prev) return prev;
+        let next = prev;
+        if (prev.activeExId) {
+          const es = { ...(prev.exSeconds || {}) };
+          es[prev.activeExId] = (es[prev.activeExId] || 0) + delta;
+          next = { ...next, exSeconds: es };
+        }
+        if (restActiveRef.current) next = { ...next, restSeconds: (next.restSeconds || 0) + delta };
+        return next;
       });
     }, 1000);
     return () => clearInterval(t);
@@ -991,8 +1381,10 @@ function ActiveWorkout({ active, setActive, u, exHistory, onPickExercise, onSave
 
   // rest countdown between sets (with audible last-5-seconds tones)
   useEffect(() => {
+    restActiveRef.current = rest != null && rest.remaining > 0;
     if (rest == null) return;
     if (rest.remaining <= 0) {
+      restActiveRef.current = false;
       if (soundOn) beep(990, 0.4, 0.22); // completion tone (higher, longer)
       if (typeof navigator !== "undefined" && navigator.vibrate) navigator.vibrate(180);
       setRest(null);
@@ -1022,19 +1414,34 @@ function ActiveWorkout({ active, setActive, u, exHistory, onPickExercise, onSave
   }); };
   const delSet = (ei, si) => upd((d) => { d.exercises[ei].sets.splice(si, 1); return d; });
   const delExercise = (ei) => upd((d) => { d.exercises.splice(ei, 1); return d; });
+  const setCardio = (ei, field, val) => { focus(ei); upd((d) => {
+    const ex = d.exercises[ei];
+    ex.cardio = { dist: "", unit: "mi", min: "", sec: "", incline: "", ...(ex.cardio || {}), [field]: val };
+    return d;
+  }); };
   const addExercise = () => onPickExercise((ex) => upd((d) => {
-    d.exercises.push({ id: "e-" + Math.random().toString(36).slice(2), name: ex.name, muscle: ex.muscle,
-      sets: [{ weight: "", reps: "", done: false }] }); return d;
+    const base = { id: "e-" + Math.random().toString(36).slice(2), name: ex.name, muscle: ex.muscle };
+    d.exercises.push(ex.muscle === "Cardio"
+      ? { ...base, sets: [], cardio: { dist: "", unit: "mi", min: "", sec: "", incline: "" } }
+      : { ...base, sets: [{ weight: "", reps: "", done: false }] });
+    return d;
   }));
 
   const finish = () => {
     const { exSeconds: _es, activeExId: _ax, restLen: _rl, ...base } = active;
-    onSave({ ...base, exercises: base.exercises.map((ex) => ({ ...ex, seconds: Math.round((exSeconds[ex.id] || 0)) })) });
+    onSave({ ...base, restSeconds: Math.round(active.restSeconds || 0), exercises: base.exercises.map((ex) => ({ ...ex, seconds: Math.round((exSeconds[ex.id] || 0)) })) });
   };
 
   const mmss = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s) % 60).padStart(2, "0")}`;
   const totalVol = round(sessionVolume(active));
   const totalSets = sessionSets(active);
+  // live calorie estimate: map each exercise's accrued seconds onto the session
+  const liveCal = bodyKg
+    ? workoutCalories(
+        { exercises: active.exercises.map((ex) => ({ ...ex, liveSeconds: exSeconds[ex.id] || 0 })) },
+        bodyKg, elapsed
+      )
+    : null;
 
   return (
     <div className="flex flex-col gap-3">
@@ -1054,9 +1461,10 @@ function ActiveWorkout({ active, setActive, u, exHistory, onPickExercise, onSave
         className="bg-transparent text-2xl font-bold outline-none" style={{ color: C.text }}
       />
 
-      <div className="grid grid-cols-2 gap-3">
+      <div className={liveCal != null ? "grid grid-cols-3 gap-3" : "grid grid-cols-2 gap-3"}>
         <Card className="p-3"><Stat label="Volume" value={totalVol.toLocaleString()} unit={u} color={C.train1} /></Card>
         <Card className="p-3"><Stat label="Sets" value={totalSets} color={C.protein1} /></Card>
+        {liveCal != null && <Card className="p-3"><Stat label="Est. cal" value={liveCal.toLocaleString()} color={C.energy1} /></Card>}
       </div>
 
       {/* Rest length selector */}
@@ -1081,6 +1489,66 @@ function ActiveWorkout({ active, setActive, u, exHistory, onPickExercise, onSave
         const lastSess = hist && hist[hist.length - 1];
         const isActiveEx = activeExId === ex.id;
         const secs = Math.round(exSeconds[ex.id] || 0);
+        if (ex.muscle === "Cardio") {
+          const c = ex.cardio || {};
+          const unit = c.unit || "mi";
+          const dist = Number(c.dist) || 0;
+          const totMin = (Number(c.min) || 0) + (Number(c.sec) || 0) / 60;
+          const paceMin = dist > 0 && totMin > 0 ? totMin / dist : null;
+          const pace = paceMin ? `${Math.floor(paceMin)}:${String(Math.round((paceMin % 1) * 60)).padStart(2, "0")}` : null;
+          const spd = cardioSpeedMph(c);
+          const spdDisp = spd != null ? (unit === "km" ? spd * 1.609344 : spd) : null;
+          const cal = bodyKg && totMin > 0 ? Math.round(cardioMET(ex) * bodyKg * (totMin / 60)) : null;
+          return (
+            <Card key={ex.id} className="p-4" style={isActiveEx ? { outline: `1.5px solid ${C.train1}` } : undefined}>
+              <div className="mb-3 flex items-center justify-between gap-2">
+                <button onClick={() => focus(ei)} className="min-w-0 flex-1 text-left">
+                  <p className="truncate font-bold">{ex.name}</p>
+                  <p className="truncate text-xs" style={{ color: C.sub }}>Cardio{pace ? ` · ${pace}/${unit}` : ""}{spdDisp != null ? ` · ${spdDisp.toFixed(1)} ${unit === "km" ? "km/h" : "mph"}` : ""}</p>
+                </button>
+                <button onClick={() => delExercise(ei)} className="p-1"><Trash2 size={15} color={C.faint} /></button>
+              </div>
+              <div className="flex items-end gap-2">
+                <div className="flex-1">
+                  <p className="mb-1 text-xs font-semibold" style={{ color: C.faint }}>DISTANCE</p>
+                  <NumField value={c.dist ?? ""} onChange={(val) => setCardio(ei, "dist", val)} placeholder="0" />
+                </div>
+                <div className="mb-0.5 flex rounded-xl p-1" style={{ background: C.card2 }}>
+                  {["mi", "km"].map((un) => (
+                    <button key={un} onClick={() => setCardio(ei, "unit", un)} className="rounded-lg px-2.5 py-1 text-xs font-bold"
+                      style={{ background: unit === un ? C.train1 : "transparent", color: unit === un ? "#001012" : C.sub }}>{un}</button>
+                  ))}
+                </div>
+              </div>
+              <div className="mt-3 flex items-end gap-2">
+                <div className="flex-1">
+                  <p className="mb-1 text-xs font-semibold" style={{ color: C.faint }}>TIME (MIN : SEC)</p>
+                  <div className="flex items-center gap-1">
+                    <NumField value={c.min ?? ""} onChange={(val) => setCardio(ei, "min", val)} placeholder="0" />
+                    <span className="font-bold" style={{ color: C.faint }}>:</span>
+                    <NumField value={c.sec ?? ""} onChange={(val) => setCardio(ei, "sec", val)} placeholder="00" />
+                  </div>
+                </div>
+                <div className="w-20">
+                  <p className="mb-1 text-xs font-semibold" style={{ color: C.faint }}>INCLINE %</p>
+                  <NumField value={c.incline ?? ""} onChange={(val) => setCardio(ei, "incline", val)} placeholder="0" />
+                </div>
+              </div>
+              {(pace || cal != null) && (
+                <div className="mt-3 flex items-center gap-2">
+                  {pace && <div className="flex-1 rounded-xl px-3 py-2" style={{ background: C.card2 }}>
+                    <p className="text-xs" style={{ color: C.faint }}>Pace</p>
+                    <p className="font-bold" style={{ color: C.train1 }}>{pace}<span className="text-xs font-semibold" style={{ color: C.sub }}> /{unit}</span></p>
+                  </div>}
+                  {cal != null && <div className="flex-1 rounded-xl px-3 py-2" style={{ background: C.card2 }}>
+                    <p className="text-xs" style={{ color: C.faint }}>Est. cal</p>
+                    <p className="font-bold" style={{ color: C.energy1 }}>{cal.toLocaleString()}</p>
+                  </div>}
+                </div>
+              )}
+            </Card>
+          );
+        }
         return (
           <Card key={ex.id} className="p-4" style={isActiveEx ? { outline: `1.5px solid ${C.train1}` } : undefined}>
             <div className="mb-2 flex items-center justify-between gap-2">
@@ -1569,8 +2037,9 @@ function StatsView({ workouts, body, food, settings, exHistory, u, onOpenExercis
   }), [buckets, workouts]);
 
   const summary = useMemo(() => {
-    let vol = 0, sets = 0, wCount = 0;
-    workouts.forEach((w) => { if (w.date >= start && w.date <= end) { vol += sessionVolume(w); sets += sessionSets(w); wCount++; } });
+    const kg = bodyKgOf(body, settings.units);
+    let vol = 0, sets = 0, wCount = 0, burned = 0, distMi = 0;
+    workouts.forEach((w) => { if (w.date >= start && w.date <= end) { vol += sessionVolume(w); sets += sessionSets(w); wCount++; burned += workoutCalories(w, kg); distMi += cardioDistanceMi(w); } });
     let calSum = 0, pSum = 0, loggedDays = 0;
     for (let d = start; d <= end && d <= today(); d = addDays(d, 1)) {
       const day = food[d]; if (!day) continue;
@@ -1578,8 +2047,8 @@ function StatsView({ workouts, body, food, settings, exHistory, u, onOpenExercis
       MEALS.forEach((m) => (day[m] || []).forEach((it) => { c += it.cal * it.qty; p += it.p * it.qty; has = true; }));
       if (has) { calSum += c; pSum += p; loggedDays++; }
     }
-    return { vol: round(vol), sets, wCount, avgCal: loggedDays ? round(calSum / loggedDays) : 0, avgP: loggedDays ? round(pSum / loggedDays) : 0 };
-  }, [start, end, workouts, food]);
+    return { vol: round(vol), sets, wCount, burned: Math.round(burned), distMi, hasKg: !!kg, avgCal: loggedDays ? round(calSum / loggedDays) : 0, avgP: loggedDays ? round(pSum / loggedDays) : 0 };
+  }, [start, end, workouts, food, body, settings.units]);
 
   const muscle = useMemo(() => {
     const acc = {}; GROUPS.forEach((g) => (acc[g] = { volume: 0, sets: 0, time: 0 }));
@@ -1636,6 +2105,8 @@ function StatsView({ workouts, body, food, settings, exHistory, u, onOpenExercis
       <div className="grid grid-cols-2 gap-3">
         <Card className="p-4"><Stat label="Workouts" value={summary.wCount} color={C.train1} /></Card>
         <Card className="p-4"><Stat label="Volume" value={summary.vol.toLocaleString()} unit={u} color={C.protein1} /></Card>
+        {summary.distMi > 0 && <Card className="p-4"><Stat label="Cardio dist" value={summary.distMi.toFixed(1)} unit="mi" color={C.train1} /></Card>}
+        {summary.hasKg && <Card className="p-4"><Stat label="Cal burned" value={summary.burned.toLocaleString()} unit="cal" color={C.energy1} /></Card>}
         <Card className="p-4"><Stat label="Avg cal/day" value={summary.avgCal ? summary.avgCal.toLocaleString() : "—"} unit={summary.avgCal ? "cal" : ""} color={C.energy1} /></Card>
         <Card className="p-4"><Stat label="Avg protein/day" value={summary.avgP || "—"} unit={summary.avgP ? "g" : ""} color={C.protein1} /></Card>
       </div>
