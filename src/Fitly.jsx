@@ -61,7 +61,7 @@ const OLD = {
 };
 
 /* ---------- date utils ---------- */
-const iso = (d) => d.toISOString().slice(0, 10);
+const iso = (d) => { const x = new Date(d); return `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, "0")}-${String(x.getDate()).padStart(2, "0")}`; };
 const today = () => iso(new Date());
 const addDays = (isoStr, n) => { const d = new Date(isoStr + "T00:00:00"); d.setDate(d.getDate() + n); return iso(d); };
 const fmtDay = (isoStr) => {
@@ -812,7 +812,7 @@ export default function App() {
      ============================================================ */
   return (
     <div className="mx-auto flex flex-col" style={{ background: C.bg, color: C.text, maxWidth: 448, minHeight: "100vh", fontFamily: '-apple-system, system-ui, "Segoe UI", Roboto, sans-serif' }}>
-      <div className="flex-1 overflow-y-auto px-4 pt-3" style={{ paddingBottom: active ? 168 : 96 }}>
+      <div className="flex-1 overflow-y-auto px-4" style={{ paddingTop: "calc(env(safe-area-inset-top) + 12px)", paddingBottom: active ? 168 : 96 }}>
         {tab === "today" && (
           <TodayView
             date={date} setDate={setDate} settings={settings} nutri={nutri}
@@ -1005,7 +1005,11 @@ export default function App() {
     });
   }
   function saveActive(session) {
-    const finished = { ...session, date: today(), id: session.id, duration: Math.round((Date.now() - session.startTime) / 60000) };
+    // Duration = tracked active time (sum of per-exercise seconds), so a workout left
+    // open in the background doesn't inflate duration or calories. Fall back to wall clock.
+    const tracked = (session.exercises || []).reduce((s, e) => s + (Number(e.seconds) || 0), 0);
+    const minutes = tracked > 0 ? Math.round(tracked / 60) : Math.round((Date.now() - session.startTime) / 60000);
+    const finished = { ...session, date: today(), id: session.id, duration: minutes };
     setWorkouts((p) => [...p, finished]);
     setActive(null);
     setDate(today());
@@ -1026,7 +1030,7 @@ function TabBar({ tab, setTab }) {
   return (
     <div className="fixed bottom-0 left-1/2 z-40 w-full -translate-x-1/2 border-t"
       style={{ background: "rgba(20,20,22,0.92)", backdropFilter: "blur(20px)", borderColor: C.line, maxWidth: 448 }}>
-      <div className="flex justify-around px-2 pb-5 pt-2">
+      <div className="flex justify-around px-2 pt-2" style={{ paddingBottom: "calc(env(safe-area-inset-bottom) + 10px)" }}>
         {items.map(([id, label, Icon]) => {
           const on = tab === id;
           return (
@@ -1410,15 +1414,21 @@ function ActiveWorkout({ active, setActive, u, exHistory, bodyKg, onPickExercise
       const delta = (now - lastTickRef.current) / 1000;
       lastTickRef.current = now;
       setElapsed(Math.round((now - active.startTime) / 1000));
-      setActive((prev) => {
+      // If the app was backgrounded / the phone locked, JS timers are paused and this
+      // single tick carries the whole idle gap. Don't pour that into work or rest —
+      // ignore the gap and drop any rest timer that was frozen mid-countdown.
+      const gap = delta > 3;
+      const accrue = gap ? 0 : delta;
+      if (gap && restActiveRef.current) { restActiveRef.current = false; setRest(null); }
+      if (accrue > 0) setActive((prev) => {
         if (!prev) return prev;
         let next = prev;
         if (prev.activeExId) {
           const es = { ...(prev.exSeconds || {}) };
-          es[prev.activeExId] = (es[prev.activeExId] || 0) + delta;
+          es[prev.activeExId] = (es[prev.activeExId] || 0) + accrue;
           next = { ...next, exSeconds: es };
         }
-        if (restActiveRef.current) next = { ...next, restSeconds: (next.restSeconds || 0) + delta };
+        if (restActiveRef.current) next = { ...next, restSeconds: (next.restSeconds || 0) + accrue };
         return next;
       });
     }, 1000);
