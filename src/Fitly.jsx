@@ -52,12 +52,14 @@ const store = {
 const K = {
   settings: "settings", workouts: "workouts", routines: "routines", food: "food",
   body: "body", customFoods: "customfoods", meals: "meals", programs: "programs", activeProgram: "activeprogram",
+  customExercises: "customexercises",
 };
 const NK = (name) => "fitly:" + name;
 // legacy keys for one-time migration into the single fitly namespace
 const OLD = {
   settings: "fittrack:settings", workouts: "fittrack:workouts", routines: "fittrack:routines", food: "fittrack:food",
   body: "fittrack:body", customFoods: "fittrack:customfoods", meals: "fittrack:meals", programs: "fittrack:programs", activeProgram: "fittrack:activeprogram",
+  customExercises: "fittrack:customexercises",
 };
 
 /* ---------- date utils ---------- */
@@ -700,6 +702,7 @@ export default function App() {
   const [food, setFood] = useState({});           // { date: { Breakfast:[], ... } }
   const [body, setBody] = useState([]);           // [{date, weight, bodyfat}]
   const [customFoods, setCustomFoods] = useState([]); // saved scanned/custom foods
+  const [customExercises, setCustomExercises] = useState([]); // user-added exercises
   const [meals, setMeals] = useState([]);             // reusable food combos
   const [programs, setPrograms] = useState([]);       // weekly routine bundles
   const [activeProgram, setActiveProgram] = useState(null); // program id
@@ -724,7 +727,7 @@ export default function App() {
         }
         await store.set("fitly:migrated", true);
       }
-      const [s, w, r, f, b, cf, ml, pg, ap] = await Promise.all([
+      const [s, w, r, f, b, cf, ml, pg, ap, cx] = await Promise.all([
         store.get(NK(K.settings), DEFAULT_SETTINGS),
         store.get(NK(K.workouts), []),
         store.get(NK(K.routines), DEFAULT_ROUTINES),
@@ -734,11 +737,13 @@ export default function App() {
         store.get(NK(K.meals), []),
         store.get(NK(K.programs), []),
         store.get(NK(K.activeProgram), null),
+        store.get(NK(K.customExercises), []),
       ]);
       setSettings({ ...DEFAULT_SETTINGS, ...s });
       setWorkouts(w || []); setRoutines(r && r.length ? r : DEFAULT_ROUTINES);
       setFood(f || {}); setBody(b || []); setCustomFoods(cf || []);
       setMeals(ml || []); setPrograms(pg || []); setActiveProgram(ap || null);
+      setCustomExercises(cx || []);
       setHydrated(true);
     })();
   }, []);
@@ -750,6 +755,7 @@ export default function App() {
   useEffect(() => { if (hydrated) store.set(NK(K.food), food); }, [food, hydrated]);
   useEffect(() => { if (hydrated) store.set(NK(K.body), body); }, [body, hydrated]);
   useEffect(() => { if (hydrated) store.set(NK(K.customFoods), customFoods); }, [customFoods, hydrated]);
+  useEffect(() => { if (hydrated) store.set(NK(K.customExercises), customExercises); }, [customExercises, hydrated]);
   useEffect(() => { if (hydrated) store.set(NK(K.meals), meals); }, [meals, hydrated]);
   useEffect(() => { if (hydrated) store.set(NK(K.programs), programs); }, [programs, hydrated]);
   useEffect(() => { if (hydrated) store.set(NK(K.activeProgram), activeProgram); }, [activeProgram, hydrated]);
@@ -941,10 +947,13 @@ export default function App() {
         );
       })()}
       {modal?.type === "pickExercise" && (
-        <ExercisePickerSheet onClose={() => setModal(null)} onPick={(ex) => { modal.cb(ex); setModal(null); }} />
+        <ExercisePickerSheet exercises={[...EXERCISES, ...customExercises]}
+          onClose={() => setModal(null)} onPick={(ex) => { modal.cb(ex); setModal(null); }}
+          onCreate={addCustomExercise} onDelete={deleteCustomExercise} />
       )}
       {modal?.type === "routineBuilder" && (
-        <RoutineBuilderSheet initial={modal.initial} onClose={() => setModal(null)}
+        <RoutineBuilderSheet initial={modal.initial} exercises={[...EXERCISES, ...customExercises]}
+          onCreate={addCustomExercise} onClose={() => setModal(null)}
           onSave={(rt) => {
             if (modal.initial?.id) setRoutines((p) => p.map((r) => (r.id === modal.initial.id ? { ...r, ...rt, id: r.id } : r)));
             else setRoutines((p) => [...p, rt]);
@@ -968,6 +977,17 @@ export default function App() {
       day[meal] = (day[meal] || []).filter((_, i) => i !== idx);
       return { ...prev, [date]: day };
     });
+  }
+  function addCustomExercise(ex) {
+    const name = (ex.name || "").trim();
+    if (!name) return null;
+    const entry = { name, muscle: MUSCLES.includes(ex.muscle) ? ex.muscle : "Chest", custom: true };
+    const exists = [...EXERCISES, ...customExercises].some((e) => e.name.toLowerCase() === name.toLowerCase());
+    if (!exists) setCustomExercises((p) => [...p, entry]);
+    return entry;
+  }
+  function deleteCustomExercise(name) {
+    setCustomExercises((p) => p.filter((e) => e.name !== name));
   }
   function cacheFood(item) {
     // only remember scanned (barcode) or custom foods, not built-in suggestions
@@ -2872,10 +2892,42 @@ function AddBodySheet({ u, last, onClose, onSave }) {
   );
 }
 
-function ExercisePickerSheet({ onClose, onPick }) {
+// Inline "create a new exercise" form, used in the exercise picker and routine builder.
+function CreateExerciseRow({ query, onCreate, accent = C.train1 }) {
+  const [open, setOpen] = useState(false);
+  const [name, setName] = useState("");
+  const [muscle, setMuscle] = useState("Chest");
+  useEffect(() => { if (open) setName(query || ""); }, [open]); // eslint-disable-line
+  if (!open) {
+    return (
+      <button onClick={() => setOpen(true)} className="mt-2 flex w-full items-center justify-center gap-1 rounded-xl py-2.5 text-sm font-bold" style={{ background: C.card2, color: accent }}>
+        <Plus size={15} /> Create new exercise
+      </button>
+    );
+  }
+  const add = () => { const n = name.trim(); if (!n) return; onCreate({ name: n, muscle }); setOpen(false); setName(""); };
+  return (
+    <div className="mt-2 rounded-xl p-3" style={{ background: C.card2 }}>
+      <input value={name} onChange={(e) => setName(e.target.value)} autoFocus placeholder="Exercise name"
+        className="mb-2 w-full rounded-lg px-3 py-2 font-semibold outline-none" style={{ background: C.card3, color: C.text }} />
+      <div className="mb-2 flex gap-2 overflow-x-auto pb-1">
+        {MUSCLES.map((m) => (
+          <button key={m} onClick={() => setMuscle(m)} className="whitespace-nowrap rounded-full px-3 py-1.5 text-xs font-semibold"
+            style={{ background: muscle === m ? accent : C.card3, color: muscle === m ? "#001012" : C.sub }}>{m}</button>
+        ))}
+      </div>
+      <div className="flex gap-2">
+        <button onClick={() => { setOpen(false); setName(""); }} className="flex-1 rounded-lg py-2 text-sm font-bold" style={{ background: C.card3, color: C.sub }}>Cancel</button>
+        <button onClick={add} disabled={!name.trim()} className="flex-1 rounded-lg py-2 text-sm font-bold" style={{ background: accent, color: "#001012", opacity: name.trim() ? 1 : 0.5 }}>Add exercise</button>
+      </div>
+    </div>
+  );
+}
+
+function ExercisePickerSheet({ exercises = EXERCISES, onClose, onPick, onCreate, onDelete }) {
   const [q, setQ] = useState("");
   const [muscle, setMuscle] = useState("All");
-  const list = EXERCISES.filter((e) =>
+  const list = exercises.filter((e) =>
     (muscle === "All" || e.muscle === muscle) && e.name.toLowerCase().includes(q.toLowerCase()));
   return (
     <Sheet title="Add exercise" onClose={onClose} accent={C.train1}>
@@ -2890,26 +2942,33 @@ function ExercisePickerSheet({ onClose, onPick }) {
             style={{ background: muscle === m ? C.train1 : C.card2, color: muscle === m ? "#001012" : C.sub }}>{m}</button>
         ))}
       </div>
+      {onCreate && <CreateExerciseRow query={q} onCreate={(ex) => { const e = onCreate(ex); onPick(e || ex); }} />}
       <div className="mt-2 pb-2">
         {list.map((e) => (
-          <button key={e.name} onClick={() => onPick(e)} className="flex w-full items-center justify-between border-t py-2.5 text-left" style={{ borderColor: C.line }}>
-            <span className="font-semibold">{e.name}</span>
-            <span className="text-xs font-medium" style={{ color: C.faint }}>{e.muscle}</span>
-          </button>
+          <div key={e.name} className="flex items-center border-t" style={{ borderColor: C.line }}>
+            <button onClick={() => onPick(e)} className="flex flex-1 items-center justify-between py-2.5 text-left">
+              <span className="font-semibold">{e.name}{e.custom && <span className="ml-2 rounded px-1.5 py-0.5 font-bold" style={{ background: C.card3, color: C.faint, fontSize: 10 }}>CUSTOM</span>}</span>
+              <span className="text-xs font-medium" style={{ color: C.faint }}>{e.muscle}</span>
+            </button>
+            {e.custom && onDelete && (
+              <button onClick={() => onDelete(e.name)} className="pl-3 pr-1" aria-label="Delete exercise"><Trash2 size={15} color={C.faint} /></button>
+            )}
+          </div>
         ))}
+        {list.length === 0 && <p className="py-4 text-center text-sm" style={{ color: C.sub }}>No matches. Use “Create new exercise” above to add it.</p>}
       </div>
     </Sheet>
   );
 }
 
-function RoutineBuilderSheet({ initial, onClose, onSave }) {
+function RoutineBuilderSheet({ initial, exercises = EXERCISES, onCreate, onClose, onSave }) {
   const [name, setName] = useState(initial?.name || "");
   const [picked, setPicked] = useState(initial?.exercises ? initial.exercises.map((e) => ({ ...e })) : []);
   const [q, setQ] = useState("");
   const [muscle, setMuscle] = useState("All");
   const colors = [C.energy1, C.train1, C.protein1, C.carb, C.fat];
   const [color, setColor] = useState(initial?.color || colors[0]);
-  const list = EXERCISES.filter((e) =>
+  const list = exercises.filter((e) =>
     (muscle === "All" || e.muscle === muscle) && e.name.toLowerCase().includes(q.toLowerCase()));
   const toggle = (e) => setPicked((p) => p.find((x) => x.name === e.name) ? p.filter((x) => x.name !== e.name) : [...p, { ...e, targetSets: 4, targetReps: 8 }]);
 
@@ -2949,12 +3008,13 @@ function RoutineBuilderSheet({ initial, onClose, onSave }) {
             style={{ background: muscle === m ? C.train1 : C.card2, color: muscle === m ? "#001012" : C.sub }}>{m}</button>
         ))}
       </div>
+      {onCreate && <CreateExerciseRow query={q} onCreate={(ex) => { const e = onCreate(ex); toggle(e || ex); }} />}
       <div className="mt-2 max-h-60 overflow-y-auto">
         {list.map((e) => {
           const on = picked.find((x) => x.name === e.name);
           return (
             <button key={e.name} onClick={() => toggle(e)} className="flex w-full items-center justify-between border-t py-2.5 text-left" style={{ borderColor: C.line }}>
-              <span className="font-semibold" style={{ color: on ? C.train1 : C.text }}>{e.name}</span>
+              <span className="font-semibold" style={{ color: on ? C.train1 : C.text }}>{e.name}{e.custom && <span className="ml-2 rounded px-1.5 py-0.5 font-bold" style={{ background: C.card3, color: C.faint, fontSize: 10 }}>CUSTOM</span>}</span>
               {on ? <Check size={18} color={C.train1} /> : <Plus size={16} color={C.faint} />}
             </button>
           );
