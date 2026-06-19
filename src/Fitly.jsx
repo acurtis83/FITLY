@@ -89,6 +89,7 @@ const DEFAULT_SETTINGS = {
   goalSets: 18, goalWeight: 175, goalBodyfat: 12, name: "Athlete",
   goalTrainMin: 45, goalBurn: 500, goalVolume: 12000, goalDistance: 3, goalWorkouts: 1,
   todayMetrics: ["energy", "protein", "sets"],
+  soundVolume: "high", keepAwake: true,
 };
 
 const EXERCISES = [
@@ -837,7 +838,7 @@ export default function App() {
             ? <ExerciseProgress name={exDetail} history={exHistory[exDetail] || []} u={u} onBack={() => setExDetail(null)} />
             : <WorkoutView
                 active={active} setActive={setActive} routines={routines} workouts={workouts}
-                u={u} exHistory={exHistory} bodyKg={bodyKgOf(body, settings.units)}
+                u={u} exHistory={exHistory} bodyKg={bodyKgOf(body, settings.units)} settings={settings}
                 programs={programs} activeProgram={activeProgram}
                 startRoutineById={startRoutineById}
                 onPickExercise={(cb) => setModal({ type: "pickExercise", cb })}
@@ -1231,10 +1232,10 @@ function MacroMini({ label, val, goal, color }) {
 /* ============================================================
    WORKOUT  (routines + active session)
    ============================================================ */
-function WorkoutView({ active, setActive, routines, workouts, u, exHistory, bodyKg, programs, activeProgram, startRoutineById, onPickExercise, onNewRoutine, onEditRoutine, onDuplicateRoutine, onDeleteRoutine, onNewProgram, onEditProgram, onDeleteProgram, onSetActiveProgram, onSaveWorkout, onOpenExercise, onOpenWorkout, onDeleteWorkout }) {
+function WorkoutView({ active, setActive, routines, workouts, u, exHistory, bodyKg, settings, programs, activeProgram, startRoutineById, onPickExercise, onNewRoutine, onEditRoutine, onDuplicateRoutine, onDeleteRoutine, onNewProgram, onEditProgram, onDeleteProgram, onSetActiveProgram, onSaveWorkout, onOpenExercise, onOpenWorkout, onDeleteWorkout }) {
   if (active) {
     return <ActiveWorkout active={active} setActive={setActive} u={u} exHistory={exHistory} bodyKg={bodyKg}
-      onPickExercise={onPickExercise} onSave={onSaveWorkout} />;
+      settings={settings} onPickExercise={onPickExercise} onSave={onSaveWorkout} />;
   }
   const startEmpty = () => setActive({ id: "w-" + Date.now(), name: "Quick Workout", startTime: Date.now(), exercises: [] });
   const [histQuery, setHistQuery] = useState("");
@@ -1365,7 +1366,7 @@ function WorkoutView({ active, setActive, routines, workouts, u, exHistory, body
   );
 }
 
-function ActiveWorkout({ active, setActive, u, exHistory, bodyKg, onPickExercise, onSave }) {
+function ActiveWorkout({ active, setActive, u, exHistory, bodyKg, settings, onPickExercise, onSave }) {
   const [rest, setRest] = useState(null); // {remaining, total}
   const timerRef = useRef(null);
   const restActiveRef = useRef(false);
@@ -1399,13 +1400,15 @@ function ActiveWorkout({ active, setActive, u, exHistory, bodyKg, onPickExercise
     if (!ctx) return;
     try {
       if (ctx.state === "suspended") ctx.resume(); // in case it was suspended while waiting
+      const mult = { low: 1.4, med: 2.8, high: 4.8 }[settings?.soundVolume] || 2.8;
+      const peak = Math.min(0.92, vol * mult); // louder, but capped below clipping
       const osc = ctx.createOscillator();
       const gain = ctx.createGain();
       osc.type = type; osc.frequency.value = freq;
       osc.connect(gain); gain.connect(ctx.destination);
       const t = ctx.currentTime;
       gain.gain.setValueAtTime(0.0001, t);
-      gain.gain.exponentialRampToValueAtTime(vol, t + 0.01);
+      gain.gain.exponentialRampToValueAtTime(peak, t + 0.01);
       gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
       osc.start(t); osc.stop(t + dur + 0.02);
     } catch { /* ignore */ }
@@ -1421,6 +1424,29 @@ function ActiveWorkout({ active, setActive, u, exHistory, bodyKg, onPickExercise
       window.removeEventListener("touchend", unlock);
     };
   }, []);
+
+  // keep the screen awake during the workout so the rest tone + timer keep running
+  // (web apps on iOS can't play audio once the screen actually locks, so we hold the screen on)
+  useEffect(() => {
+    if (settings && settings.keepAwake === false) return;
+    let lock = null;
+    const acquire = async () => {
+      try {
+        if (document.visibilityState === "visible" && navigator.wakeLock && !lock) {
+          lock = await navigator.wakeLock.request("screen");
+          lock.addEventListener && lock.addEventListener("release", () => { lock = null; });
+        }
+      } catch { /* not supported / denied */ }
+    };
+    const onVis = () => { if (document.visibilityState === "visible") acquire(); };
+    acquire();
+    document.addEventListener("visibilitychange", onVis);
+    return () => {
+      document.removeEventListener("visibilitychange", onVis);
+      try { lock && lock.release && lock.release(); } catch { /* ignore */ }
+      lock = null;
+    };
+  }, [settings && settings.keepAwake]);
 
   const restLen = active.restLen ?? 90;
   const exSeconds = active.exSeconds || {};
@@ -2368,6 +2394,28 @@ function SettingsSheet({ settings, setSettings, onClose }) {
       {row("Daily sets target", "goalSets", "sets")}
       {row("Goal weight", "goalWeight", s.units)}
       {row("Goal body fat", "goalBodyfat", "%")}
+
+      <p className="mt-3 mb-1 text-xs font-bold uppercase tracking-wide" style={{ color: C.faint }}>Rest timer</p>
+      <div className="flex items-center justify-between py-2.5">
+        <span className="font-semibold">Tone volume</span>
+        <div className="flex rounded-xl p-1" style={{ background: C.card2 }}>
+          {[["low", "Low"], ["med", "Med"], ["high", "High"]].map(([v, lbl]) => (
+            <button key={v} onClick={() => setS((p) => ({ ...p, soundVolume: v }))}
+              className="rounded-lg px-3 py-1 text-sm font-bold"
+              style={{ background: s.soundVolume === v ? C.train1 : "transparent", color: s.soundVolume === v ? "#001012" : C.sub }}>{lbl}</button>
+          ))}
+        </div>
+      </div>
+      <button onClick={() => setS((p) => ({ ...p, keepAwake: !(p.keepAwake !== false) }))} className="flex w-full items-center justify-between py-2.5 text-left">
+        <div className="pr-4">
+          <p className="font-semibold" style={{ color: C.text }}>Keep screen awake</p>
+          <p className="text-xs" style={{ color: C.sub }}>Holds the screen on during a workout so the rest tone keeps sounding.</p>
+        </div>
+        <div className="flex h-7 w-12 flex-shrink-0 items-center rounded-full px-0.5" style={{ background: s.keepAwake !== false ? C.train1 : C.card3, justifyContent: s.keepAwake !== false ? "flex-end" : "flex-start" }}>
+          <div className="h-6 w-6 rounded-full" style={{ background: "#fff" }} />
+        </div>
+      </button>
+
       <button onClick={() => { setSettings(s); onClose(); }} className="mt-4 w-full rounded-2xl py-3.5 font-bold" style={{ background: C.protein1, color: "#06210A" }}>
         Save
       </button>
