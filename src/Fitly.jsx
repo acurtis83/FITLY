@@ -89,7 +89,7 @@ const DEFAULT_SETTINGS = {
   goalSets: 18, goalWeight: 175, goalBodyfat: 12, name: "Athlete",
   goalTrainMin: 45, goalBurn: 500, goalVolume: 12000, goalDistance: 3, goalWorkouts: 1,
   todayMetrics: ["energy", "protein", "sets"],
-  soundVolume: "high", keepAwake: true,
+  keepAwake: true,
 };
 
 const EXERCISES = [
@@ -279,14 +279,16 @@ const cardioDistanceMi = (w) => (w.exercises || []).reduce((t, ex) => {
 }, 0);
 // estimate kcal for one workout. totalSec optional (live); else uses w.duration (minutes).
 function workoutCalories(w, kg, totalSecOverride) {
-  if (!kg) return 0;
   let cardioSec = 0, cardioKcal = 0;
   (w.exercises || []).forEach((ex) => {
     if (ex.muscle !== "Cardio") return;
+    const manualCal = ex.cardio ? Number(ex.cardio.cal) : 0;
     const manual = ex.cardio ? (Number(ex.cardio.min || 0) * 60 + Number(ex.cardio.sec || 0)) : 0;
     const sec = manual || ex.seconds || ex.liveSeconds || 0;
-    if (sec > 0) { cardioKcal += cardioMET(ex) * kg * (sec / 3600); cardioSec += sec; }
+    if (manualCal > 0) { cardioKcal += manualCal; cardioSec += sec; }
+    else if (sec > 0 && kg) { cardioKcal += cardioMET(ex) * kg * (sec / 3600); cardioSec += sec; }
   });
+  if (!kg) return Math.round(cardioKcal); // without bodyweight, only manually-entered cardio calories count
   const totalSec = totalSecOverride != null ? totalSecOverride : (w.duration || 0) * 60;
   let strengthSec = Math.max(0, totalSec - cardioSec);
   if (totalSec <= 0 && cardioSec === 0) strengthSec = sessionSets(w) * 48; // no timing at all
@@ -1373,60 +1375,8 @@ function ActiveWorkout({ active, setActive, u, exHistory, bodyKg, settings, onPi
   const [elapsed, setElapsed] = useState(0);
   const [confirmDiscard, setConfirmDiscard] = useState(false);
   const lastTickRef = useRef(Date.now());
-  const [soundOn, setSoundOn] = useState(true);
-  const audioRef = useRef(null);
-  const warmedRef = useRef(false);
 
-  const ensureAudio = () => {
-    try {
-      if (!audioRef.current) {
-        const AC = window.AudioContext || window.webkitAudioContext;
-        if (AC) audioRef.current = new AC();
-      }
-      const ctx = audioRef.current;
-      if (!ctx) return;
-      if (ctx.state === "suspended") ctx.resume();
-      // warm-up: play one silent sample so iOS fully unlocks the audio output
-      if (!warmedRef.current) {
-        const buf = ctx.createBuffer(1, 1, 22050);
-        const src = ctx.createBufferSource();
-        src.buffer = buf; src.connect(ctx.destination); src.start(0);
-        warmedRef.current = true;
-      }
-    } catch { /* audio unsupported */ }
-  };
-  const beep = (freq, dur = 0.12, vol = 0.18, type = "sine") => {
-    const ctx = audioRef.current;
-    if (!ctx) return;
-    try {
-      if (ctx.state === "suspended") ctx.resume(); // in case it was suspended while waiting
-      const mult = { low: 1.4, med: 2.8, high: 4.8 }[settings?.soundVolume] || 2.8;
-      const peak = Math.min(0.92, vol * mult); // louder, but capped below clipping
-      const osc = ctx.createOscillator();
-      const gain = ctx.createGain();
-      osc.type = type; osc.frequency.value = freq;
-      osc.connect(gain); gain.connect(ctx.destination);
-      const t = ctx.currentTime;
-      gain.gain.setValueAtTime(0.0001, t);
-      gain.gain.exponentialRampToValueAtTime(peak, t + 0.01);
-      gain.gain.exponentialRampToValueAtTime(0.0001, t + dur);
-      osc.start(t); osc.stop(t + dur + 0.02);
-    } catch { /* ignore */ }
-  };
-
-  // unlock audio on the very first interaction anywhere in the workout
-  useEffect(() => {
-    const unlock = () => ensureAudio();
-    window.addEventListener("pointerdown", unlock, { once: true });
-    window.addEventListener("touchend", unlock, { once: true });
-    return () => {
-      window.removeEventListener("pointerdown", unlock);
-      window.removeEventListener("touchend", unlock);
-    };
-  }, []);
-
-  // keep the screen awake during the workout so the rest tone + timer keep running
-  // (web apps on iOS can't play audio once the screen actually locks, so we hold the screen on)
+  // keep the screen awake during the workout so the rest timer stays visible
   useEffect(() => {
     if (settings && settings.keepAwake === false) return;
     let lock = null;
@@ -1448,7 +1398,7 @@ function ActiveWorkout({ active, setActive, u, exHistory, bodyKg, settings, onPi
     };
   }, [settings && settings.keepAwake]);
 
-  const restLen = active.restLen ?? 90;
+  const restLen = active.restLen ?? 60;
   const exSeconds = active.exSeconds || {};
   const activeExId = active.activeExId || null;
 
@@ -1460,21 +1410,24 @@ function ActiveWorkout({ active, setActive, u, exHistory, bodyKg, settings, onPi
       const delta = (now - lastTickRef.current) / 1000;
       lastTickRef.current = now;
       setElapsed(Math.round((now - active.startTime) / 1000));
-      // If the app was backgrounded / the phone locked, JS timers are paused and this
-      // single tick carries the whole idle gap. Don't pour that into work or rest —
-      // ignore the gap and drop any rest timer that was frozen mid-countdown.
+      // A big delta means the app was backgrounded / the phone was locked and timers paused.
+      // The exercise timer should still count that real time (it's a stopwatch), but a rest
+      // countdown that froze mid-way shouldn't dump the whole gap into rest — drop it instead.
       const gap = delta > 3;
-      const accrue = gap ? 0 : delta;
       if (gap && restActiveRef.current) { restActiveRef.current = false; setRest(null); }
-      if (accrue > 0) setActive((prev) => {
+      if (delta > 0) setActive((prev) => {
         if (!prev) return prev;
         let next = prev;
         if (prev.activeExId) {
-          const es = { ...(prev.exSeconds || {}) };
-          es[prev.activeExId] = (es[prev.activeExId] || 0) + accrue;
-          next = { ...next, exSeconds: es };
+          const fe = prev.exercises.find((e) => e.id === prev.activeExId);
+          const feDone = fe && (fe.muscle === "Cardio" ? (fe.cardio && fe.cardio.done) : fe.done);
+          if (fe && !feDone) {
+            const es = { ...(prev.exSeconds || {}) };
+            es[prev.activeExId] = (es[prev.activeExId] || 0) + delta; // real time, includes locked screen
+            next = { ...next, exSeconds: es };
+          }
         }
-        if (restActiveRef.current) next = { ...next, restSeconds: (next.restSeconds || 0) + accrue };
+        if (restActiveRef.current && !gap) next = { ...next, restSeconds: (next.restSeconds || 0) + delta };
         return next;
       });
     }, 1000);
@@ -1486,18 +1439,16 @@ function ActiveWorkout({ active, setActive, u, exHistory, bodyKg, settings, onPi
     if (!active.activeExId && active.exercises[0]) setActive((p) => ({ ...p, activeExId: active.exercises[0].id }));
   }, []); // eslint-disable-line
 
-  // rest countdown between sets (with audible last-5-seconds tones)
+  // rest countdown between sets (visual; silent haptic on completion)
   useEffect(() => {
     restActiveRef.current = rest != null && rest.remaining > 0;
     if (rest == null) return;
     if (rest.remaining <= 0) {
       restActiveRef.current = false;
-      if (soundOn) beep(990, 0.4, 0.22); // completion tone (higher, longer)
       if (typeof navigator !== "undefined" && navigator.vibrate) navigator.vibrate(180);
       setRest(null);
       return;
     }
-    if (soundOn && rest.remaining <= 5) beep(660, 0.12, 0.16); // countdown tick at 5,4,3,2,1
     timerRef.current = setTimeout(() => setRest((r) => (r ? { ...r, remaining: r.remaining - 1 } : null)), 1000);
     return () => clearTimeout(timerRef.current);
   }, [rest]);
@@ -1513,23 +1464,36 @@ function ActiveWorkout({ active, setActive, u, exHistory, bodyKg, settings, onPi
     const wasDone = active.exercises[ei].sets[si].done;
     focus(ei);
     toggleDone(ei, si);
-    if (!wasDone) { if (soundOn) ensureAudio(); setRest({ remaining: restLen, total: restLen }); }
+    if (!wasDone) { setRest({ remaining: restLen, total: restLen }); }
   };
   const addSet = (ei) => { focus(ei); upd((d) => {
+    d.exercises[ei].done = false; // adding a set re-opens a completed exercise and resumes its timer
     const sets = d.exercises[ei].sets; const lastS = sets[sets.length - 1];
     sets.push({ weight: lastS ? lastS.weight : "", reps: "", done: false }); return d;
   }); };
   const delSet = (ei, si) => upd((d) => { d.exercises[ei].sets.splice(si, 1); return d; });
   const delExercise = (ei) => upd((d) => { d.exercises.splice(ei, 1); return d; });
+  // mark an exercise complete/incomplete; completing stops its timer by handing focus to the next unfinished one
+  const setExDone = (ei, val) => upd((d) => {
+    const ex = d.exercises[ei];
+    if (ex.muscle === "Cardio") ex.cardio = { ...(ex.cardio || {}), done: val };
+    else ex.done = val;
+    if (val && d.activeExId === ex.id) {
+      const isDone = (e) => e.muscle === "Cardio" ? !!(e.cardio && e.cardio.done) : !!e.done;
+      const nxt = d.exercises.find((e, i) => i !== ei && !isDone(e));
+      d.activeExId = nxt ? nxt.id : null;
+    }
+    return d;
+  });
   const setCardio = (ei, field, val) => { focus(ei); upd((d) => {
     const ex = d.exercises[ei];
-    ex.cardio = { dist: "", unit: "mi", min: "", sec: "", incline: "", ...(ex.cardio || {}), [field]: val };
+    ex.cardio = { dist: "", unit: "mi", min: "", sec: "", incline: "", hr: "", elev: "", cal: "", ...(ex.cardio || {}), [field]: val };
     return d;
   }); };
   const addExercise = () => onPickExercise((ex) => upd((d) => {
     const base = { id: "e-" + Math.random().toString(36).slice(2), name: ex.name, muscle: ex.muscle };
     d.exercises.push(ex.muscle === "Cardio"
-      ? { ...base, sets: [], cardio: { dist: "", unit: "mi", min: "", sec: "", incline: "" } }
+      ? { ...base, sets: [], cardio: { dist: "", unit: "mi", min: "", sec: "", incline: "", hr: "", elev: "", cal: "" } }
       : { ...base, sets: [{ weight: "", reps: "", done: false }] });
     return d;
   }));
@@ -1542,13 +1506,16 @@ function ActiveWorkout({ active, setActive, u, exHistory, bodyKg, settings, onPi
   const mmss = (s) => `${Math.floor(s / 60)}:${String(Math.floor(s) % 60).padStart(2, "0")}`;
   const totalVol = round(sessionVolume(active));
   const totalSets = sessionSets(active);
-  // live calorie estimate: map each exercise's accrued seconds onto the session
-  const liveCal = bodyKg
-    ? workoutCalories(
-        { exercises: active.exercises.map((ex) => ({ ...ex, liveSeconds: exSeconds[ex.id] || 0 })) },
-        bodyKg, elapsed
-      )
-    : null;
+  // live calorie estimate (uses manual cardio calories when entered, even without bodyweight)
+  const liveCal = workoutCalories(
+    { exercises: active.exercises.map((ex) => ({ ...ex, liveSeconds: exSeconds[ex.id] || 0 })) },
+    bodyKg || 0, elapsed
+  );
+  // completion is explicit (a button) for both strength and cardio — checking sets never auto-completes
+  const exComplete = (ex) => ex.muscle === "Cardio" ? !!(ex.cardio && ex.cardio.done) : !!ex.done;
+  const rankOf = (ex) => (exComplete(ex) ? 2 : (activeExId === ex.id ? 0 : 1));
+  const order = active.exercises.map((ex, ei) => ({ ex, ei })).sort((a, b) => rankOf(a.ex) - rankOf(b.ex));
+  const toggleCardioDone = (ei) => setExDone(ei, !exComplete(active.exercises[ei]));
 
   return (
     <div className="flex flex-col gap-3">
@@ -1576,30 +1543,43 @@ function ActiveWorkout({ active, setActive, u, exHistory, bodyKg, settings, onPi
         </div>
       </Card>
 
-      <div className={liveCal != null ? "grid grid-cols-3 gap-3" : "grid grid-cols-2 gap-3"}>
-        <Card className="p-3"><Stat label="Volume" value={totalVol.toLocaleString()} unit={u} color={C.train1} /></Card>
-        <Card className="p-3"><Stat label="Sets" value={totalSets} color={C.protein1} /></Card>
-        {liveCal != null && <Card className="p-3"><Stat label="Est. cal" value={liveCal.toLocaleString()} color={C.energy1} /></Card>}
-      </div>
+      {/* Rest countdown — pinned right under Elapsed */}
+      {rest && (
+        <Card className="p-3">
+          <div className="flex items-center gap-3">
+            <Timer size={20} color={C.train1} />
+            <div className="flex flex-col" style={{ minWidth: 56 }}>
+              <span className="font-mono text-xl font-bold leading-none" style={{ color: C.train1 }}>{mmss(rest.remaining)}</span>
+              <span className="text-xs" style={{ color: C.faint }}>rest</span>
+            </div>
+            <div className="h-1.5 flex-1 overflow-hidden rounded-full" style={{ background: C.card3 }}>
+              <div className="h-full rounded-full" style={{ width: `${(rest.remaining / rest.total) * 100}%`, background: C.train1, transition: "width 1s linear" }} />
+            </div>
+            <button onClick={() => setRest((r) => ({ ...r, remaining: r.remaining + 30, total: r.total + 30 }))} className="text-sm font-bold" style={{ color: C.sub }}>+30s</button>
+            <button onClick={() => setRest(null)} className="text-sm font-bold" style={{ color: C.energy1 }}>Skip</button>
+          </div>
+        </Card>
+      )}
 
       {/* Rest length selector */}
       <div className="flex items-center gap-2">
-        <Timer size={15} color={C.sub} />
-        <span className="text-xs font-semibold" style={{ color: C.sub }}>Rest</span>
-        {[60, 90, 120, 150].map((s) => (
-          <button key={s} onClick={() => setRestLen(s)} className="flex-1 rounded-full py-1.5 text-xs font-bold"
+        <Timer size={16} color={C.sub} />
+        <span className="text-sm font-semibold" style={{ color: C.sub }}>Rest</span>
+        {[60, 90, 120].map((s) => (
+          <button key={s} onClick={() => setRestLen(s)} className="flex-1 rounded-xl py-3 text-base font-bold"
             style={{ background: restLen === s ? C.train1 : C.card2, color: restLen === s ? "#001012" : C.sub }}>
             {s}s
           </button>
         ))}
-        <button onClick={() => { setSoundOn((v) => !v); if (!soundOn) { ensureAudio(); beep(660, 0.1, 0.16); } }}
-          title={soundOn ? "Countdown sound on" : "Countdown sound off"}
-          className="flex h-7 w-8 items-center justify-center rounded-full" style={{ background: C.card2 }}>
-          {soundOn ? <Volume2 size={15} color={C.train1} /> : <VolumeX size={15} color={C.faint} />}
-        </button>
       </div>
 
-      {active.exercises.map((ex, ei) => {
+      <div className={liveCal > 0 ? "grid grid-cols-3 gap-3" : "grid grid-cols-2 gap-3"}>
+        <Card className="p-3"><Stat label="Volume" value={totalVol.toLocaleString()} unit={u} color={C.train1} /></Card>
+        <Card className="p-3"><Stat label="Sets" value={totalSets} color={C.protein1} /></Card>
+        {liveCal > 0 && <Card className="p-3"><Stat label="Est. cal" value={liveCal.toLocaleString()} color={C.energy1} /></Card>}
+      </div>
+
+      {order.map(({ ex, ei }) => {
         const hist = exHistory[ex.name];
         const lastSess = hist && hist[hist.length - 1];
         const isActiveEx = activeExId === ex.id;
@@ -1611,18 +1591,18 @@ function ActiveWorkout({ active, setActive, u, exHistory, bodyKg, settings, onPi
           const totMin = (Number(c.min) || 0) + (Number(c.sec) || 0) / 60;
           const paceMin = dist > 0 && totMin > 0 ? totMin / dist : null;
           const pace = paceMin ? `${Math.floor(paceMin)}:${String(Math.round((paceMin % 1) * 60)).padStart(2, "0")}` : null;
-          const spd = cardioSpeedMph(c);
-          const spdDisp = spd != null ? (unit === "km" ? spd * 1.609344 : spd) : null;
-          const cal = bodyKg && totMin > 0 ? Math.round(cardioMET(ex) * bodyKg * (totMin / 60)) : null;
+          const metCal = bodyKg && totMin > 0 ? Math.round(cardioMET(ex) * bodyKg * (totMin / 60)) : null;
+          const elevUnit = unit === "km" ? "m" : "ft";
+          const done = !!c.done;
           return (
             <SwipeRow key={ex.id} onDelete={() => delExercise(ei)} ring={isActiveEx ? C.train1 : null} contentClassName="p-4">
-              <div className="mb-3 flex items-center justify-between gap-2">
+              <div className="mb-3 flex items-center justify-between gap-2" style={{ opacity: done ? 0.6 : 1 }}>
                 <button onClick={() => focus(ei)} className="min-w-0 flex-1 text-left">
                   <p className="truncate font-bold">{ex.name}</p>
-                  <p className="truncate text-xs" style={{ color: C.sub }}>Cardio{pace ? ` · ${pace}/${unit}` : ""}{spdDisp != null ? ` · ${spdDisp.toFixed(1)} ${unit === "km" ? "km/h" : "mph"}` : ""}</p>
+                  <p className="truncate text-xs" style={{ color: C.sub }}>Cardio{pace ? ` · ${pace}/${unit}` : ""}{c.hr ? ` · ${c.hr} bpm` : ""}</p>
                 </button>
               </div>
-              <div className="flex items-end gap-2">
+              <div className="flex items-end gap-2" style={{ opacity: done ? 0.6 : 1 }}>
                 <div className="flex-1">
                   <p className="mb-1 text-xs font-semibold" style={{ color: C.faint }}>DISTANCE</p>
                   <NumField value={c.dist ?? ""} onChange={(val) => setCardio(ei, "dist", val)} placeholder="0" />
@@ -1634,7 +1614,7 @@ function ActiveWorkout({ active, setActive, u, exHistory, bodyKg, settings, onPi
                   ))}
                 </div>
               </div>
-              <div className="mt-3 flex items-end gap-2">
+              <div className="mt-3 flex items-end gap-2" style={{ opacity: done ? 0.6 : 1 }}>
                 <div className="flex-1">
                   <p className="mb-1 text-xs font-semibold" style={{ color: C.faint }}>TIME (MIN : SEC)</p>
                   <div className="flex items-center gap-1">
@@ -1648,18 +1628,30 @@ function ActiveWorkout({ active, setActive, u, exHistory, bodyKg, settings, onPi
                   <NumField value={c.incline ?? ""} onChange={(val) => setCardio(ei, "incline", val)} placeholder="0" />
                 </div>
               </div>
-              {(pace || cal != null) && (
-                <div className="mt-3 flex items-center gap-2">
-                  {pace && <div className="flex-1 rounded-xl px-3 py-2" style={{ background: C.card2 }}>
-                    <p className="text-xs" style={{ color: C.faint }}>Pace</p>
-                    <p className="font-bold" style={{ color: C.train1 }}>{pace}<span className="text-xs font-semibold" style={{ color: C.sub }}> /{unit}</span></p>
-                  </div>}
-                  {cal != null && <div className="flex-1 rounded-xl px-3 py-2" style={{ background: C.card2 }}>
-                    <p className="text-xs" style={{ color: C.faint }}>Est. cal</p>
-                    <p className="font-bold" style={{ color: C.energy1 }}>{cal.toLocaleString()}</p>
-                  </div>}
+              <div className="mt-3 flex items-end gap-2" style={{ opacity: done ? 0.6 : 1 }}>
+                <div className="flex-1">
+                  <p className="mb-1 text-xs font-semibold" style={{ color: C.faint }}>AVG HR (BPM)</p>
+                  <NumField value={c.hr ?? ""} onChange={(val) => setCardio(ei, "hr", val)} placeholder="0" />
+                </div>
+                <div className="flex-1">
+                  <p className="mb-1 text-xs font-semibold" style={{ color: C.faint }}>ELEV GAIN ({elevUnit})</p>
+                  <NumField value={c.elev ?? ""} onChange={(val) => setCardio(ei, "elev", val)} placeholder="0" />
+                </div>
+                <div className="flex-1">
+                  <p className="mb-1 text-xs font-semibold" style={{ color: C.faint }}>EST. CAL</p>
+                  <NumField value={c.cal ?? ""} onChange={(val) => setCardio(ei, "cal", val)} placeholder={metCal != null ? String(metCal) : "0"} />
+                </div>
+              </div>
+              {pace && (
+                <div className="mt-3 rounded-xl px-3 py-2" style={{ background: C.card2 }}>
+                  <p className="text-xs" style={{ color: C.faint }}>Pace</p>
+                  <p className="font-bold" style={{ color: C.train1 }}>{pace}<span className="text-xs font-semibold" style={{ color: C.sub }}> /{unit}</span></p>
                 </div>
               )}
+              <button onClick={() => toggleCardioDone(ei)} className="mt-3 flex w-full items-center justify-center gap-1 rounded-xl py-2.5 text-sm font-bold"
+                style={{ background: done ? C.protein1 : C.card2, color: done ? "#06210A" : C.protein1 }}>
+                <Check size={15} strokeWidth={3} /> {done ? "Completed" : "Complete"}
+              </button>
             </SwipeRow>
           );
         }
@@ -1672,11 +1664,11 @@ function ActiveWorkout({ active, setActive, u, exHistory, bodyKg, settings, onPi
                   {ex.muscle}{lastSess ? ` · last: ${lastSess.top.weight}${u}×${lastSess.top.reps}` : " · new"}
                 </p>
               </button>
-              <button onClick={() => focus(ei)} title={isActiveEx ? "Timing this exercise" : "Tap to time this exercise"}
-                className="flex items-center gap-1 rounded-full px-2 py-1" style={{ background: isActiveEx ? "rgba(0,240,200,0.15)" : C.card2 }}>
-                {isActiveEx && <span className="h-1.5 w-1.5 animate-pulse rounded-full" style={{ background: C.train1 }} />}
-                <Timer size={12} color={isActiveEx ? C.train1 : C.faint} />
-                <span className="font-mono text-xs font-bold" style={{ color: isActiveEx ? C.train1 : C.sub }}>{mmss(secs)}</span>
+              <button onClick={() => focus(ei)} title={ex.done ? "Completed" : (isActiveEx ? "Timing this exercise" : "Tap to time this exercise")}
+                className="flex items-center gap-1 rounded-full px-2 py-1" style={{ background: isActiveEx && !ex.done ? "rgba(0,240,200,0.15)" : C.card2 }}>
+                {isActiveEx && !ex.done && <span className="h-1.5 w-1.5 animate-pulse rounded-full" style={{ background: C.train1 }} />}
+                <Timer size={12} color={ex.done ? C.faint : (isActiveEx ? C.train1 : C.faint)} />
+                <span className="font-mono text-xs font-bold" style={{ color: ex.done ? C.sub : (isActiveEx ? C.train1 : C.sub) }}>{mmss(secs)}</span>
               </button>
             </div>
             <div className="mb-1 flex items-center gap-2 px-1 text-xs font-semibold" style={{ color: C.faint }}>
@@ -1700,9 +1692,15 @@ function ActiveWorkout({ active, setActive, u, exHistory, bodyKg, settings, onPi
                 </button>
               </div>
             ))}
-            <button onClick={() => addSet(ei)} className="mt-1 w-full rounded-xl py-2 text-sm font-semibold" style={{ background: C.card2, color: C.train1 }}>
-              + Add Set
-            </button>
+            <div className="mt-1 flex gap-2">
+              <button onClick={() => addSet(ei)} className="flex-1 rounded-xl py-2.5 text-sm font-bold" style={{ background: C.card2, color: C.train1 }}>
+                + Add Set
+              </button>
+              <button onClick={() => setExDone(ei, !ex.done)} className="flex flex-1 items-center justify-center gap-1 rounded-xl py-2.5 text-sm font-bold"
+                style={{ background: ex.done ? C.protein1 : C.card2, color: ex.done ? "#06210A" : C.protein1 }}>
+                <Check size={15} strokeWidth={3} /> {ex.done ? "Completed" : "Complete"}
+              </button>
+            </div>
           </SwipeRow>
         );
       })}
@@ -1715,23 +1713,6 @@ function ActiveWorkout({ active, setActive, u, exHistory, bodyKg, settings, onPi
       <button onClick={finish} className="mb-2 rounded-3xl py-4 font-bold" style={{ background: C.protein1, color: "#06210A" }}>
         Finish Workout
       </button>
-
-      {/* Rest timer between sets */}
-      {rest && (
-        <div className="fixed bottom-20 left-1/2 z-30 flex w-full -translate-x-1/2 items-center gap-3 rounded-full px-4 py-3 shadow-xl"
-          style={{ background: C.card, maxWidth: 420, width: "92%", border: `1px solid ${C.line}` }}>
-          <Timer size={20} color={C.train1} />
-          <div className="flex flex-col" style={{ minWidth: 64 }}>
-            <span className="font-mono text-lg font-bold leading-none" style={{ color: C.train1 }}>{mmss(rest.remaining)}</span>
-            <span className="text-xs" style={{ color: C.faint }}>rest</span>
-          </div>
-          <div className="h-1.5 flex-1 overflow-hidden rounded-full" style={{ background: C.card3 }}>
-            <div className="h-full rounded-full" style={{ width: `${(rest.remaining / rest.total) * 100}%`, background: C.train1, transition: "width 1s linear" }} />
-          </div>
-          <button onClick={() => setRest((r) => ({ ...r, remaining: r.remaining + 30, total: r.total + 30 }))} className="text-sm font-bold" style={{ color: C.sub }}>+30s</button>
-          <button onClick={() => setRest(null)} className="text-sm font-bold" style={{ color: C.energy1 }}>Skip</button>
-        </div>
-      )}
     </div>
   );
 }
@@ -2395,21 +2376,11 @@ function SettingsSheet({ settings, setSettings, onClose }) {
       {row("Goal weight", "goalWeight", s.units)}
       {row("Goal body fat", "goalBodyfat", "%")}
 
-      <p className="mt-3 mb-1 text-xs font-bold uppercase tracking-wide" style={{ color: C.faint }}>Rest timer</p>
-      <div className="flex items-center justify-between py-2.5">
-        <span className="font-semibold">Tone volume</span>
-        <div className="flex rounded-xl p-1" style={{ background: C.card2 }}>
-          {[["low", "Low"], ["med", "Med"], ["high", "High"]].map(([v, lbl]) => (
-            <button key={v} onClick={() => setS((p) => ({ ...p, soundVolume: v }))}
-              className="rounded-lg px-3 py-1 text-sm font-bold"
-              style={{ background: s.soundVolume === v ? C.train1 : "transparent", color: s.soundVolume === v ? "#001012" : C.sub }}>{lbl}</button>
-          ))}
-        </div>
-      </div>
+      <p className="mt-3 mb-1 text-xs font-bold uppercase tracking-wide" style={{ color: C.faint }}>Workout</p>
       <button onClick={() => setS((p) => ({ ...p, keepAwake: !(p.keepAwake !== false) }))} className="flex w-full items-center justify-between py-2.5 text-left">
         <div className="pr-4">
           <p className="font-semibold" style={{ color: C.text }}>Keep screen awake</p>
-          <p className="text-xs" style={{ color: C.sub }}>Holds the screen on during a workout so the rest tone keeps sounding.</p>
+          <p className="text-xs" style={{ color: C.sub }}>Holds the screen on during a workout so the rest timer stays visible.</p>
         </div>
         <div className="flex h-7 w-12 flex-shrink-0 items-center rounded-full px-0.5" style={{ background: s.keepAwake !== false ? C.train1 : C.card3, justifyContent: s.keepAwake !== false ? "flex-end" : "flex-start" }}>
           <div className="h-6 w-6 rounded-full" style={{ background: "#fff" }} />
