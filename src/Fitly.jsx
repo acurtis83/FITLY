@@ -2151,6 +2151,91 @@ function bucketize(start, end) {
   return out;
 }
 
+// Per-exercise weight progression chart with its own exercise picker + date range.
+function ExerciseProgressCard({ exHistory, u }) {
+  const names = useMemo(
+    () => Object.keys(exHistory).filter((n) => (exHistory[n] || []).some((h) => h.top && Number(h.top.weight) > 0)).sort(),
+    [exHistory]
+  );
+  const [name, setName] = useState(names[0] || "");
+  const [open, setOpen] = useState(false);
+  const [range, setRange] = useState("month");
+  const [from, setFrom] = useState(addDays(today(), -29));
+  const [to, setTo] = useState(today());
+  useEffect(() => { if (names.length && !names.includes(name)) setName(names[0]); }, [names, name]);
+
+  const hist = exHistory[name] || [];
+  const allStart = hist.length ? hist[0].date : today();
+  const { start, end } = windowRange(range, from, to, allStart);
+  const data = hist
+    .filter((h) => h.date >= start && h.date <= end)
+    .map((h) => ({ date: shortDate(h.date), weight: round(h.top.weight), e1rm: round(h.est1rm) }));
+
+  if (!names.length) {
+    return (
+      <Card className="p-4">
+        <h3 className="mb-1 font-bold">Exercise progress</h3>
+        <p className="text-sm" style={{ color: C.sub }}>Log a few weighted sets and your weight-per-set trend will show up here.</p>
+      </Card>
+    );
+  }
+
+  return (
+    <Card className="p-4">
+      <h3 className="mb-3 font-bold">Exercise progress</h3>
+
+      <div className="relative mb-3">
+        <button onClick={() => setOpen((v) => !v)} className="flex w-full items-center justify-between rounded-xl px-3 py-2.5 font-semibold" style={{ background: C.card2, color: C.text }}>
+          <span className="truncate">{name || "Select exercise"}</span>
+          <ChevronDown size={18} color={C.sub} />
+        </button>
+        {open && (
+          <div className="absolute left-0 right-0 z-20 mt-1 max-h-60 overflow-y-auto rounded-xl p-1 shadow-xl" style={{ background: C.card2, border: `1px solid ${C.line}` }}>
+            {names.map((n) => (
+              <button key={n} onClick={() => { setName(n); setOpen(false); }} className="block w-full truncate rounded-lg px-3 py-2 text-left text-sm font-semibold"
+                style={{ background: n === name ? C.card3 : "transparent", color: n === name ? C.train1 : C.text }}>{n}</button>
+            ))}
+          </div>
+        )}
+      </div>
+
+      <Segmented value={range} onChange={setRange} options={[["week", "Week"], ["month", "Month"], ["custom", "Custom"], ["all", "All"]]} />
+      {range === "custom" && (
+        <div className="mt-2 flex items-center gap-2">
+          <input type="date" value={from} max={to} onChange={(e) => setFrom(e.target.value)}
+            className="flex-1 rounded-xl px-3 py-2 text-sm font-semibold outline-none" style={{ background: C.card2, color: C.text, colorScheme: "dark" }} />
+          <span style={{ color: C.faint }}>→</span>
+          <input type="date" value={to} min={from} max={today()} onChange={(e) => setTo(e.target.value)}
+            className="flex-1 rounded-xl px-3 py-2 text-sm font-semibold outline-none" style={{ background: C.card2, color: C.text, colorScheme: "dark" }} />
+        </div>
+      )}
+
+      {data.length >= 2 ? (
+        <div className="mt-3">
+          <ResponsiveContainer width="100%" height={200}>
+            <LineChart data={data} margin={{ top: 5, right: 8, left: -18, bottom: 0 }}>
+              <CartesianGrid stroke={C.line} vertical={false} />
+              <XAxis dataKey="date" tick={{ fill: C.faint, fontSize: 11 }} axisLine={false} tickLine={false} />
+              <YAxis tick={{ fill: C.faint, fontSize: 11 }} axisLine={false} tickLine={false} domain={["dataMin - 5", "dataMax + 5"]} />
+              <Tooltip contentStyle={{ background: C.card2, border: "none", borderRadius: 12, color: C.text }} />
+              <Line type="monotone" dataKey="weight" stroke={C.energy1} strokeWidth={3} dot={{ r: 3, fill: C.energy1 }} name={`Top set (${u})`} />
+              <Line type="monotone" dataKey="e1rm" stroke={C.carb} strokeWidth={2} strokeDasharray="4 4" dot={false} name={`Est 1RM (${u})`} />
+            </LineChart>
+          </ResponsiveContainer>
+          <div className="mt-1 flex items-center justify-center gap-4 text-xs" style={{ color: C.sub }}>
+            <span className="flex items-center gap-1"><span className="inline-block h-2 w-2 rounded-full" style={{ background: C.energy1 }} /> Top-set weight</span>
+            <span className="flex items-center gap-1"><span className="inline-block h-1 w-3 rounded-full" style={{ background: C.carb }} /> Est. 1RM</span>
+          </div>
+        </div>
+      ) : (
+        <p className="mt-3 text-sm" style={{ color: C.sub }}>
+          {data.length === 1 ? "Only one session in this range — log this lift again to see the line." : "No sessions for this exercise in the selected range."}
+        </p>
+      )}
+    </Card>
+  );
+}
+
 function StatsView({ workouts, body, food, settings, exHistory, u, onOpenExercise }) {
   const [range, setRange] = useState("week");
   const [from, setFrom] = useState(addDays(today(), -29));
@@ -2257,6 +2342,8 @@ function StatsView({ workouts, body, food, settings, exHistory, u, onOpenExercis
           </BarChart>
         </ResponsiveContainer>
       </Card>
+
+      <ExerciseProgressCard exHistory={exHistory} u={u} />
 
       {/* Muscle focus */}
       <Card className="p-4">
